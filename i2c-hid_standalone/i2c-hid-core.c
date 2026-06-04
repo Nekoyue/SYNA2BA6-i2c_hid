@@ -38,21 +38,13 @@
 #include <linux/mutex.h>
 #include <linux/unaligned.h>
 
-#include <drm/drm_panel.h>
-
-#include "../hid-ids.h"
 #include "i2c-hid.h"
 
+#define I2C_VENDOR_ID_SYNAPTICS			0x06cb
+#define I2C_PRODUCT_ID_SYNAPTICS_SYNA2BA6	0xcf00
+
 /* quirks to control the device */
-#define I2C_HID_QUIRK_NO_IRQ_AFTER_RESET	BIT(0)
-#define I2C_HID_QUIRK_BOGUS_IRQ			BIT(1)
-#define I2C_HID_QUIRK_RESET_ON_RESUME		BIT(2)
-#define I2C_HID_QUIRK_BAD_INPUT_SIZE		BIT(3)
-#define I2C_HID_QUIRK_NO_WAKEUP_AFTER_RESET	BIT(4)
-#define I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND	BIT(5)
-#define I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME BIT(6)
-#define I2C_HID_QUIRK_RE_POWER_ON		BIT(7)
-#define I2C_HID_QUIRK_WAKE_AFTER_IDLE		BIT(8)
+#define I2C_HID_QUIRK_WAKE_AFTER_IDLE		BIT(0)
 
 /* Command opcodes */
 #define I2C_HID_OPCODE_RESET			0x01
@@ -117,30 +109,8 @@ struct i2c_hid {
 	struct mutex		reset_lock;
 
 	struct i2chid_ops	*ops;
-	struct drm_panel_follower panel_follower;
-	struct work_struct	panel_follower_work;
 	struct work_struct	idle_wake_work;
-	bool			is_panel_follower;
-	bool			panel_follower_work_finished;
 	unsigned long		last_input_jiffies;
-};
-
-static const struct i2c_hid_quirks {
-	__u16 idVendor;
-	__u16 idProduct;
-	__u32 quirks;
-} i2c_hid_quirks[] = {
-	/*
-	 * Project-specific test quirk for SYNA2BA6:00 06CB:CF00.
-	 * This touchpad can resume in a degraded state where pointer movement
-	 * still works but multitouch gestures, including two-finger scrolling,
-	 * stop working. Queue a light wake/resync when input resumes after an
-	 * idle gap, inspired by the Synaptics Windows driver's
-	 * SendDribblePacketAfterResume setting.
-	 */
-	{ I2C_VENDOR_ID_SYNAPTICS, I2C_PRODUCT_ID_SYNAPTICS_SYNA2BA6,
-		 I2C_HID_QUIRK_WAKE_AFTER_IDLE },
-	{ 0, 0 }
 };
 
 /*
@@ -152,16 +122,17 @@ static const struct i2c_hid_quirks {
  */
 static u32 i2c_hid_lookup_quirk(const u16 idVendor, const u16 idProduct)
 {
-	u32 quirks = 0;
-	int n;
+	/*
+	 * SYNA2BA6:00 06CB:CF00 can resume in a degraded state where pointer
+	 * movement still works but multitouch gestures stop working. Queue a
+	 * light wake/resync when input resumes after an idle gap, inspired by
+	 * the Synaptics Windows driver's SendDribblePacketAfterResume setting.
+	 */
+	if (idVendor == I2C_VENDOR_ID_SYNAPTICS &&
+	    idProduct == I2C_PRODUCT_ID_SYNAPTICS_SYNA2BA6)
+		return I2C_HID_QUIRK_WAKE_AFTER_IDLE;
 
-	for (n = 0; i2c_hid_quirks[n].idVendor; n++)
-		if (i2c_hid_quirks[n].idVendor == idVendor &&
-		    (i2c_hid_quirks[n].idProduct == (__u16)HID_ANY_ID ||
-		     i2c_hid_quirks[n].idProduct == idProduct))
-			quirks = i2c_hid_quirks[n].quirks;
-
-	return quirks;
+	return 0;
 }
 
 static int i2c_hid_probe_address(struct i2c_hid *ihid)
@@ -494,20 +465,15 @@ static int i2c_hid_finish_hwreset(struct i2c_hid *ihid)
 
 	i2c_hid_dbg(ihid, "%s: waiting...\n", __func__);
 
-	if (ihid->quirks & I2C_HID_QUIRK_NO_IRQ_AFTER_RESET) {
-		msleep(100);
-		clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
-	} else if (!wait_event_timeout(ihid->wait,
-				       !test_bit(I2C_HID_RESET_PENDING, &ihid->flags),
-				       msecs_to_jiffies(1000))) {
+	if (!wait_event_timeout(ihid->wait,
+				!test_bit(I2C_HID_RESET_PENDING, &ihid->flags),
+				msecs_to_jiffies(1000))) {
 		dev_warn(&ihid->client->dev, "device did not ack reset within 1000 ms\n");
 		clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
 	}
 	i2c_hid_dbg(ihid, "%s: finished.\n", __func__);
 
-	/* At least some SIS devices need this after reset */
-	if (!(ihid->quirks & I2C_HID_QUIRK_NO_WAKEUP_AFTER_RESET))
-		ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
+	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
 
 	return ret;
 }
@@ -588,23 +554,11 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		return;
 	}
 
-	if ((ihid->quirks & I2C_HID_QUIRK_BOGUS_IRQ) && ret_size == 0xffff) {
-		dev_warn_once(&ihid->client->dev,
-			      "%s: IRQ triggered but there's no data\n",
-			      __func__);
-		return;
-	}
-
 	if (ret_size > size || ret_size < sizeof(__le16)) {
-		if (ihid->quirks & I2C_HID_QUIRK_BAD_INPUT_SIZE) {
-			*(__le16 *)ihid->inbuf = cpu_to_le16(size);
-			ret_size = size;
-		} else {
-			dev_err(&ihid->client->dev,
-				"%s: incomplete report (%d/%d)\n",
-				__func__, size, ret_size);
-			return;
-		}
+		dev_err(&ihid->client->dev,
+			"%s: incomplete report (%d/%d)\n",
+			__func__, size, ret_size);
+		return;
 	}
 
 	i2c_hid_dbg(ihid, "input: %*ph\n", ret_size, ihid->inbuf);
@@ -787,7 +741,7 @@ static int i2c_hid_parse(struct hid_device *hid)
 	struct i2c_client *client = hid->driver_data;
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 	struct i2c_hid_desc *hdesc = &ihid->hdesc;
-	char *rdesc = NULL, *use_override = NULL;
+	char *rdesc;
 	unsigned int rsize;
 	int ret;
 	int tries = 3;
@@ -813,26 +767,18 @@ static int i2c_hid_parse(struct hid_device *hid)
 	if (ret)
 		return ret;
 
-	use_override = i2c_hid_get_dmi_hid_report_desc_override(client->name,
-								&rsize);
+	rdesc = kzalloc(rsize, GFP_KERNEL);
+	if (!rdesc)
+		return -ENOMEM;
 
-	if (use_override) {
-		rdesc = use_override;
-		i2c_hid_dbg(ihid, "Using a HID report descriptor override\n");
-	} else {
-		rdesc = kzalloc(rsize, GFP_KERNEL);
-		if (!rdesc)
-			return -ENOMEM;
+	i2c_hid_dbg(ihid, "asking HID report descriptor\n");
 
-		i2c_hid_dbg(ihid, "asking HID report descriptor\n");
-
-		ret = i2c_hid_read_register(ihid,
-					    ihid->hdesc.wReportDescRegister,
-					    rdesc, rsize);
-		if (ret) {
-			hid_err(hid, "reading report descriptor failed\n");
-			goto out;
-		}
+	ret = i2c_hid_read_register(ihid,
+				    ihid->hdesc.wReportDescRegister,
+				    rdesc, rsize);
+	if (ret) {
+		hid_err(hid, "reading report descriptor failed\n");
+		goto out;
 	}
 
 	i2c_hid_dbg(ihid, "Report Descriptor: %*ph\n", rsize, rdesc);
@@ -842,8 +788,7 @@ static int i2c_hid_parse(struct hid_device *hid)
 		dbg_hid("parsing report descriptor failed\n");
 
 out:
-	if (!use_override)
-		kfree(rdesc);
+	kfree(rdesc);
 
 	return ret;
 }
@@ -933,28 +878,21 @@ static int i2c_hid_init_irq(struct i2c_client *client)
 
 static int i2c_hid_fetch_hid_descriptor(struct i2c_hid *ihid)
 {
-	struct i2c_client *client = ihid->client;
 	struct i2c_hid_desc *hdesc = &ihid->hdesc;
 	unsigned int dsize;
 	int error;
 
 	/* i2c hid fetch using a fixed descriptor size (30 bytes) */
-	if (i2c_hid_get_dmi_i2c_hid_desc_override(client->name)) {
-		i2c_hid_dbg(ihid, "Using a HID descriptor override\n");
-		ihid->hdesc =
-			*i2c_hid_get_dmi_i2c_hid_desc_override(client->name);
-	} else {
-		i2c_hid_dbg(ihid, "Fetching the HID descriptor\n");
-		error = i2c_hid_read_register(ihid,
-					      ihid->wHIDDescRegister,
-					      &ihid->hdesc,
-					      sizeof(ihid->hdesc));
-		if (error) {
-			dev_err(&ihid->client->dev,
-				"failed to fetch HID descriptor: %d\n",
-				error);
-			return -ENODEV;
-		}
+	i2c_hid_dbg(ihid, "Fetching the HID descriptor\n");
+	error = i2c_hid_read_register(ihid,
+				      ihid->wHIDDescRegister,
+				      &ihid->hdesc,
+				      sizeof(ihid->hdesc));
+	if (error) {
+		dev_err(&ihid->client->dev,
+			"failed to fetch HID descriptor: %d\n",
+			error);
+		return -ENODEV;
 	}
 
 	/* Validate the length of HID descriptor, the 4 first bytes:
@@ -979,22 +917,6 @@ static int i2c_hid_fetch_hid_descriptor(struct i2c_hid *ihid)
 	return 0;
 }
 
-static int i2c_hid_core_power_up(struct i2c_hid *ihid)
-{
-	if (!ihid->ops->power_up)
-		return 0;
-
-	return ihid->ops->power_up(ihid->ops);
-}
-
-static void i2c_hid_core_power_down(struct i2c_hid *ihid)
-{
-	if (!ihid->ops->power_down)
-		return;
-
-	ihid->ops->power_down(ihid->ops);
-}
-
 static void i2c_hid_core_shutdown_tail(struct i2c_hid *ihid)
 {
 	if (!ihid->ops->shutdown_tail)
@@ -1011,7 +933,7 @@ static void i2c_hid_core_restore_sequence(struct i2c_hid *ihid)
 	ihid->ops->restore_sequence(ihid->ops);
 }
 
-static int i2c_hid_core_suspend(struct i2c_hid *ihid, bool force_poweroff)
+static int i2c_hid_core_suspend(struct i2c_hid *ihid)
 {
 	struct i2c_client *client = ihid->client;
 	struct hid_device *hid = ihid->hid;
@@ -1021,55 +943,21 @@ static int i2c_hid_core_suspend(struct i2c_hid *ihid, bool force_poweroff)
 	if (ret < 0)
 		return ret;
 
-	/* Save some power */
-	if (!(ihid->quirks & I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND))
-		i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
+	i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
 
 	disable_irq(client->irq);
-
-	if (force_poweroff || !device_may_wakeup(&client->dev))
-		i2c_hid_core_power_down(ihid);
 
 	return 0;
 }
 
 static int i2c_hid_core_resume(struct i2c_hid *ihid)
 {
-	struct i2c_client *client = ihid->client;
 	struct hid_device *hid = ihid->hid;
 	int ret;
 
-	if (!device_may_wakeup(&client->dev))
-		i2c_hid_core_power_up(ihid);
+	enable_irq(ihid->client->irq);
 
-	enable_irq(client->irq);
-
-	/* On Goodix 27c6:0d42 wait extra time before device wakeup.
-	 * It's not clear why but if we send wakeup too early, the device will
-	 * never trigger input interrupts.
-	 */
-	if (ihid->quirks & I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME)
-		msleep(1500);
-
-	/* Instead of resetting device, simply powers the device on. This
-	 * solves "incomplete reports" on Raydium devices 2386:3118 and
-	 * 2386:4B33 and fixes various SIS touchscreens no longer sending
-	 * data after a suspend/resume.
-	 *
-	 * However some ALPS touchpads generate IRQ storm without reset, so
-	 * let's still reset them here. SYNA2BA6 uses the idle-input wake path
-	 * instead because its failure does not always involve system resume.
-	 */
-	if (ihid->quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
-		mutex_lock(&ihid->reset_lock);
-		ret = i2c_hid_start_hwreset(ihid);
-		if (ret == 0)
-			ret = i2c_hid_finish_hwreset(ihid);
-		mutex_unlock(&ihid->reset_lock);
-	} else {
-		ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
-	}
-
+	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
 	if (ret)
 		return ret;
 
@@ -1106,9 +994,6 @@ static int __i2c_hid_core_probe(struct i2c_hid *ihid)
 	hid->vendor = le16_to_cpu(ihid->hdesc.wVendorID);
 	hid->product = le16_to_cpu(ihid->hdesc.wProductID);
 
-	hid->initial_quirks |= i2c_hid_get_dmi_quirks(hid->vendor,
-						      hid->product);
-
 	snprintf(hid->name, sizeof(hid->name), "%s %04X:%04X",
 		 client->name, (u16)hid->vendor, (u16)hid->product);
 	strscpy(hid->phys, dev_name(&client->dev), sizeof(hid->phys));
@@ -1134,140 +1019,11 @@ static int i2c_hid_core_register_hid(struct i2c_hid *ihid)
 		return ret;
 	}
 
-	/* At least some QTEC devices need this after initialization */
-	if (ihid->quirks & I2C_HID_QUIRK_RE_POWER_ON)
-		ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
-
-	return ret;
-}
-
-static int i2c_hid_core_probe_panel_follower(struct i2c_hid *ihid)
-{
-	int ret;
-
-	ret = i2c_hid_core_power_up(ihid);
-	if (ret)
-		return ret;
-
-	ret = __i2c_hid_core_probe(ihid);
-	if (ret)
-		goto err_power_down;
-
-	ret = i2c_hid_core_register_hid(ihid);
-	if (ret)
-		goto err_power_down;
-
-	return 0;
-
-err_power_down:
-	i2c_hid_core_power_down(ihid);
-
-	return ret;
-}
-
-static void ihid_core_panel_follower_work(struct work_struct *work)
-{
-	struct i2c_hid *ihid = container_of(work, struct i2c_hid,
-					    panel_follower_work);
-	struct hid_device *hid = ihid->hid;
-	int ret;
-
-	/*
-	 * hid->version is set on the first power up. If it's still zero then
-	 * this is the first power on so we should perform initial power up
-	 * steps.
-	 */
-	if (!hid->version)
-		ret = i2c_hid_core_probe_panel_follower(ihid);
-	else
-		ret = i2c_hid_core_resume(ihid);
-
-	if (ret)
-		dev_warn(&ihid->client->dev, "Power on failed: %d\n", ret);
-	else
-		WRITE_ONCE(ihid->panel_follower_work_finished, true);
-
-	/*
-	 * The work APIs provide a number of memory ordering guarantees
-	 * including one that says that memory writes before schedule_work()
-	 * are always visible to the work function, but they don't appear to
-	 * guarantee that a write that happened in the work is visible after
-	 * cancel_work_sync(). We'll add a write memory barrier here to match
-	 * with i2c_hid_core_panel_unpreparing() to ensure that our write to
-	 * panel_follower_work_finished is visible there.
-	 */
-	smp_wmb();
-}
-
-static int i2c_hid_core_panel_follower_resume(struct drm_panel_follower *follower)
-{
-	struct i2c_hid *ihid = container_of(follower, struct i2c_hid, panel_follower);
-
-	/*
-	 * Powering on a touchscreen can be a slow process. Queue the work to
-	 * the system workqueue so we don't block the panel's power up.
-	 */
-	WRITE_ONCE(ihid->panel_follower_work_finished, false);
-	schedule_work(&ihid->panel_follower_work);
-
-	return 0;
-}
-
-static int i2c_hid_core_panel_follower_suspend(struct drm_panel_follower *follower)
-{
-	struct i2c_hid *ihid = container_of(follower, struct i2c_hid, panel_follower);
-
-	cancel_work_sync(&ihid->panel_follower_work);
-
-	/* Match with ihid_core_panel_follower_work() */
-	smp_rmb();
-	if (!READ_ONCE(ihid->panel_follower_work_finished))
-		return 0;
-
-	return i2c_hid_core_suspend(ihid, true);
-}
-
-static const struct drm_panel_follower_funcs
-				i2c_hid_core_panel_follower_prepare_funcs = {
-	.panel_prepared = i2c_hid_core_panel_follower_resume,
-	.panel_unpreparing = i2c_hid_core_panel_follower_suspend,
-};
-
-static const struct drm_panel_follower_funcs
-				i2c_hid_core_panel_follower_enable_funcs = {
-	.panel_enabled = i2c_hid_core_panel_follower_resume,
-	.panel_disabling = i2c_hid_core_panel_follower_suspend,
-};
-
-static int i2c_hid_core_register_panel_follower(struct i2c_hid *ihid)
-{
-	struct device *dev = &ihid->client->dev;
-	int ret;
-
-	if (ihid->hid->initial_quirks & HID_QUIRK_POWER_ON_AFTER_BACKLIGHT)
-		ihid->panel_follower.funcs = &i2c_hid_core_panel_follower_enable_funcs;
-	else
-		ihid->panel_follower.funcs = &i2c_hid_core_panel_follower_prepare_funcs;
-
-	/*
-	 * If we're not in control of our own power up/power down then we can't
-	 * do the logic to manage wakeups. Give a warning if a user thought
-	 * that was possible then force the capability off.
-	 */
-	if (device_can_wakeup(dev)) {
-		dev_warn(dev, "Can't wakeup if following panel\n");
-		device_set_wakeup_capable(dev, false);
-	}
-
-	ret = drm_panel_add_follower(dev, &ihid->panel_follower);
-	if (ret)
-		return ret;
-
 	return 0;
 }
 
 int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
-		       u16 hid_descriptor_address, u32 quirks)
+		       u16 hid_descriptor_address)
 {
 	int ret;
 	struct i2c_hid *ihid;
@@ -1297,13 +1053,11 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	ihid->ops = ops;
 	ihid->client = client;
 	ihid->wHIDDescRegister = cpu_to_le16(hid_descriptor_address);
-	ihid->is_panel_follower = drm_is_panel_follower(&client->dev);
 	ihid->last_input_jiffies = jiffies;
 
 	init_waitqueue_head(&ihid->wait);
 	mutex_init(&ihid->cmd_lock);
 	mutex_init(&ihid->reset_lock);
-	INIT_WORK(&ihid->panel_follower_work, ihid_core_panel_follower_work);
 	INIT_WORK(&ihid->idle_wake_work, i2c_hid_idle_wake_work);
 
 	/* we need to allocate the command buffer without knowing the maximum
@@ -1326,31 +1080,16 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	hid->ll_driver = &i2c_hid_ll_driver;
 	hid->dev.parent = &client->dev;
 	hid->bus = BUS_I2C;
-	hid->initial_quirks = quirks;
 
-	/* Power on and probe unless device is a panel follower. */
-	if (!ihid->is_panel_follower) {
-		ret = i2c_hid_core_power_up(ihid);
-		if (ret < 0)
-			goto err_destroy_device;
-
-		ret = __i2c_hid_core_probe(ihid);
-		if (ret < 0)
-			goto err_power_down;
-	}
+	ret = __i2c_hid_core_probe(ihid);
+	if (ret < 0)
+		goto err_destroy_device;
 
 	ret = i2c_hid_init_irq(client);
 	if (ret < 0)
-		goto err_power_down;
+		goto err_destroy_device;
 
-	/*
-	 * If we're a panel follower, we'll register when the panel turns on;
-	 * otherwise we do it right away.
-	 */
-	if (ihid->is_panel_follower)
-		ret = i2c_hid_core_register_panel_follower(ihid);
-	else
-		ret = i2c_hid_core_register_hid(ihid);
+	ret = i2c_hid_core_register_hid(ihid);
 	if (ret)
 		goto err_free_irq;
 
@@ -1358,9 +1097,6 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 
 err_free_irq:
 	free_irq(client->irq, ihid);
-err_power_down:
-	if (!ihid->is_panel_follower)
-		i2c_hid_core_power_down(ihid);
 err_destroy_device:
 	hid_destroy_device(hid);
 err_free_buffers:
@@ -1377,14 +1113,7 @@ void i2c_hid_core_remove(struct i2c_client *client)
 
 	cancel_work_sync(&ihid->idle_wake_work);
 
-	/*
-	 * If we're a follower, the act of unfollowing will cause us to be
-	 * powered down. Otherwise we need to manually do it.
-	 */
-	if (ihid->is_panel_follower)
-		drm_panel_remove_follower(&ihid->panel_follower);
-	else
-		i2c_hid_core_suspend(ihid, true);
+	i2c_hid_core_suspend(ihid);
 
 	hid = ihid->hid;
 	hid_destroy_device(hid);
@@ -1412,19 +1141,13 @@ static int i2c_hid_core_pm_suspend(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 
-	if (ihid->is_panel_follower)
-		return 0;
-
-	return i2c_hid_core_suspend(ihid, false);
+	return i2c_hid_core_suspend(ihid);
 }
 
 static int i2c_hid_core_pm_resume(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
-
-	if (ihid->is_panel_follower)
-		return 0;
 
 	return i2c_hid_core_resume(ihid);
 }
@@ -1433,9 +1156,6 @@ static int i2c_hid_core_pm_restore(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
-
-	if (ihid->is_panel_follower)
-		return 0;
 
 	i2c_hid_core_restore_sequence(ihid);
 
