@@ -65,10 +65,20 @@
 
 #define i2c_hid_dbg(ihid, ...) dev_dbg(&(ihid)->client->dev, __VA_ARGS__)
 
+static LIST_HEAD(syna_resync_devices);
+static DEFINE_MUTEX(syna_resync_devices_lock);
+
 static unsigned int syna_reprobe_after_idle_ms = 100000;
 module_param(syna_reprobe_after_idle_ms, uint, 0644);
 MODULE_PARM_DESC(syna_reprobe_after_idle_ms,
 		 "Queue a SYNA2BA6 wake/resync on first input after this idle time in ms, 0 disables");
+
+static bool syna_resync_after_resume = true;
+module_param(syna_resync_after_resume, bool, 0644);
+MODULE_PARM_DESC(syna_resync_after_resume,
+		 "Queue a SYNA2BA6 wake/resync after system resume, true enables");
+
+static bool syna_resync_now;
 
 struct i2c_hid_desc {
 	__le16 wHIDDescLength;
@@ -110,6 +120,7 @@ struct i2c_hid {
 
 	struct i2chid_ops	*ops;
 	struct work_struct	idle_wake_work;
+	struct list_head	syna_resync_node;
 	unsigned long		last_input_jiffies;
 };
 
@@ -478,28 +489,71 @@ static int i2c_hid_finish_hwreset(struct i2c_hid *ihid)
 	return ret;
 }
 
-static void i2c_hid_idle_wake_work(struct work_struct *work)
+static void i2c_hid_syna_resync_work(struct work_struct *work)
 {
 	struct i2c_hid *ihid = container_of(work, struct i2c_hid,
 					    idle_wake_work);
 	struct device *dev = &ihid->client->dev;
 	int ret;
 
-	dev_info(dev, "waking/resyncing device after idle input\n");
+	dev_info(dev, "waking/resyncing Synaptics device\n");
 
 	mutex_lock(&ihid->reset_lock);
 	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
 	mutex_unlock(&ihid->reset_lock);
 
 	if (ret) {
-		dev_warn(dev, "idle input wake failed: %d\n", ret);
+		dev_warn(dev, "Synaptics wake failed: %d\n", ret);
 		return;
 	}
 
 	ret = hid_driver_reset_resume(ihid->hid);
 	if (ret)
-		dev_warn(dev, "idle input reset-resume failed: %d\n", ret);
+		dev_warn(dev, "Synaptics reset-resume failed: %d\n", ret);
 }
+
+static void i2c_hid_queue_syna_resync(struct i2c_hid *ihid)
+{
+	if (!(ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE))
+		return;
+
+	schedule_work(&ihid->idle_wake_work);
+}
+
+static int param_set_syna_resync_now(const char *val,
+				     const struct kernel_param *kp)
+{
+	struct i2c_hid *ihid;
+	bool trigger;
+	int ret;
+
+	ret = kstrtobool(val, &trigger);
+	if (ret)
+		return ret;
+
+	if (!trigger)
+		return 0;
+
+	mutex_lock(&syna_resync_devices_lock);
+	list_for_each_entry(ihid, &syna_resync_devices, syna_resync_node) {
+		dev_info(&ihid->client->dev,
+			 "manual Synaptics wake/resync requested\n");
+		i2c_hid_queue_syna_resync(ihid);
+	}
+	mutex_unlock(&syna_resync_devices_lock);
+
+	return 0;
+}
+
+static const struct kernel_param_ops param_ops_syna_resync_now = {
+	.set = param_set_syna_resync_now,
+	.get = param_get_bool,
+};
+
+module_param_cb(syna_resync_now, &param_ops_syna_resync_now,
+		&syna_resync_now, 0200);
+MODULE_PARM_DESC(syna_resync_now,
+		 "Write Y/1/true to manually queue a SYNA2BA6 wake/resync");
 
 static void i2c_hid_maybe_queue_idle_wake(struct i2c_hid *ihid)
 {
@@ -519,7 +573,7 @@ static void i2c_hid_maybe_queue_idle_wake(struct i2c_hid *ihid)
 		dev_info(&ihid->client->dev,
 			 "input after %u ms idle, threshold %u ms, queuing wake/resync\n",
 			 actual_idle_ms, syna_reprobe_after_idle_ms);
-		schedule_work(&ihid->idle_wake_work);
+		i2c_hid_queue_syna_resync(ihid);
 	}
 
 update:
@@ -939,6 +993,8 @@ static int i2c_hid_core_suspend(struct i2c_hid *ihid)
 	struct hid_device *hid = ihid->hid;
 	int ret;
 
+	cancel_work_sync(&ihid->idle_wake_work);
+
 	ret = hid_driver_suspend(hid, PMSG_SUSPEND);
 	if (ret < 0)
 		return ret;
@@ -964,6 +1020,13 @@ static int i2c_hid_core_resume(struct i2c_hid *ihid)
 	ret = hid_driver_reset_resume(hid);
 	if (ret)
 		return ret;
+
+	if (syna_resync_after_resume &&
+	    ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE) {
+		dev_info(&ihid->client->dev,
+			 "system resumed, queuing Synaptics wake/resync\n");
+		i2c_hid_queue_syna_resync(ihid);
+	}
 
 	return 0;
 }
@@ -1058,7 +1121,8 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	init_waitqueue_head(&ihid->wait);
 	mutex_init(&ihid->cmd_lock);
 	mutex_init(&ihid->reset_lock);
-	INIT_WORK(&ihid->idle_wake_work, i2c_hid_idle_wake_work);
+	INIT_WORK(&ihid->idle_wake_work, i2c_hid_syna_resync_work);
+	INIT_LIST_HEAD(&ihid->syna_resync_node);
 
 	/* we need to allocate the command buffer without knowing the maximum
 	 * size of the reports. Let's use HID_MIN_BUFFER_SIZE, then we do the
@@ -1093,6 +1157,12 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	if (ret)
 		goto err_free_irq;
 
+	if (ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE) {
+		mutex_lock(&syna_resync_devices_lock);
+		list_add_tail(&ihid->syna_resync_node, &syna_resync_devices);
+		mutex_unlock(&syna_resync_devices_lock);
+	}
+
 	return 0;
 
 err_free_irq:
@@ -1111,7 +1181,11 @@ void i2c_hid_core_remove(struct i2c_client *client)
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 	struct hid_device *hid;
 
-	cancel_work_sync(&ihid->idle_wake_work);
+	if (ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE) {
+		mutex_lock(&syna_resync_devices_lock);
+		list_del_init(&ihid->syna_resync_node);
+		mutex_unlock(&syna_resync_devices_lock);
+	}
 
 	i2c_hid_core_suspend(ihid);
 
