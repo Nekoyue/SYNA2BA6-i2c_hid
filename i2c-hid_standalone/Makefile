@@ -7,7 +7,11 @@ ifndef KDIR
 endif
 
 obj-m				+= i2c-hid.o
+obj-m				+= i2c-hid-acpi.o
 
 i2c-hid-objs					=  i2c-hid-core.o i2c-hid-dmi-quirks.o
 kbuild:
 	make -C $(KDIR) M=`pwd`
+
+clean:
+	make -C $(KDIR) M=`pwd` clean
