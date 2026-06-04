@@ -8,6 +8,9 @@ Attempt to fix: after the system has been idle or suspended,
 the touchpad still moves the pointer but loses multitouch gestures (e.g. two-finger scroll). 
 The quirk resets the device on resume instead of requiring a manual driver rebind.
 
+I also include my old fix (rebind device) under [./set-syna-power.sh](./set-syna-power.sh), 
+see script's header for usages.
+
 ## Credits
 This project is based on the work originally done by
 [coiby/standalone_i2c_hid](https://github.com/coiby/standalone_i2c_hid), with changes:
