@@ -1,12 +1,19 @@
 # Standalone I2C HID Modules for SYNA2BA6
 
-This repository builds out-of-tree Linux `i2c_hid` and `i2c_hid_acpi` kernel
-modules that add a reset-on-resume quirk for the Synaptics I2C HID touchpad
+This repository builds `i2c_hid` and `i2c_hid_acpi` kernel modules that 
+add an idle wake/resync quirk for the Synaptics I2C HID touchpad
 `SYNA2BA6:00 06CB:CF00`.
 
 Attempt to fix: after the system has been idle or suspended, 
 the touchpad still moves the pointer but loses multitouch gestures (e.g. two-finger scroll). 
-The quirk resets the device on resume instead of requiring a manual driver rebind.
+The quirk queues a lightweight wake/resync on the first touchpad input after an
+idle delay (defaults to 100s) and can be tuned with:
+
+```sh
+sudo sh -c 'printf "%s\n" 30000 > /sys/module/i2c_hid/parameters/syna_reprobe_after_idle_ms'
+```
+
+Set it to `0` to disable idle-triggered wake/resync.
 
 I also include my old fix (rebind device) under [./set-syna-power.sh](./set-syna-power.sh), 
 see script's header for usages.
@@ -134,7 +141,7 @@ Check that the out-of-tree module loaded and the touchpad re-enumerated:
 
 ```sh
 lsmod | grep i2c_hid
-sudo dmesg | grep -i 'i2c_hid\|SYNA2BA6\|hid-multitouch' | tail -80
+sudo dmesg -w | grep -i 'i2c_hid\|SYNA2BA6\|hid-multitouch'
 ```
 
 The expected log includes:

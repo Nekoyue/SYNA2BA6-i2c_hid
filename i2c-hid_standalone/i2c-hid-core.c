@@ -52,6 +52,7 @@
 #define I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND	BIT(5)
 #define I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME BIT(6)
 #define I2C_HID_QUIRK_RE_POWER_ON		BIT(7)
+#define I2C_HID_QUIRK_WAKE_AFTER_IDLE		BIT(8)
 
 /* Command opcodes */
 #define I2C_HID_OPCODE_RESET			0x01
@@ -71,6 +72,11 @@
 #define I2C_HID_PWR_SLEEP	0x01
 
 #define i2c_hid_dbg(ihid, ...) dev_dbg(&(ihid)->client->dev, __VA_ARGS__)
+
+static unsigned int syna_reprobe_after_idle_ms = 100000;
+module_param(syna_reprobe_after_idle_ms, uint, 0644);
+MODULE_PARM_DESC(syna_reprobe_after_idle_ms,
+		 "Queue a SYNA2BA6 wake/resync on first input after this idle time in ms, 0 disables");
 
 struct i2c_hid_desc {
 	__le16 wHIDDescLength;
@@ -113,8 +119,10 @@ struct i2c_hid {
 	struct i2chid_ops	*ops;
 	struct drm_panel_follower panel_follower;
 	struct work_struct	panel_follower_work;
+	struct work_struct	idle_wake_work;
 	bool			is_panel_follower;
 	bool			panel_follower_work_finished;
+	unsigned long		last_input_jiffies;
 };
 
 static const struct i2c_hid_quirks {
@@ -126,11 +134,12 @@ static const struct i2c_hid_quirks {
 	 * Project-specific test quirk for SYNA2BA6:00 06CB:CF00.
 	 * This touchpad can resume in a degraded state where pointer movement
 	 * still works but multitouch gestures, including two-finger scrolling,
-	 * stop working. Resetting the HID device on resume replaces the manual
-	 * driver rebind workaround used to recover the touchpad.
+	 * stop working. Queue a light wake/resync when input resumes after an
+	 * idle gap, inspired by the Synaptics Windows driver's
+	 * SendDribblePacketAfterResume setting.
 	 */
 	{ I2C_VENDOR_ID_SYNAPTICS, I2C_PRODUCT_ID_SYNAPTICS_SYNA2BA6,
-		 I2C_HID_QUIRK_RESET_ON_RESUME },
+		 I2C_HID_QUIRK_WAKE_AFTER_IDLE },
 	{ 0, 0 }
 };
 
@@ -503,6 +512,54 @@ static int i2c_hid_finish_hwreset(struct i2c_hid *ihid)
 	return ret;
 }
 
+static void i2c_hid_idle_wake_work(struct work_struct *work)
+{
+	struct i2c_hid *ihid = container_of(work, struct i2c_hid,
+					    idle_wake_work);
+	struct device *dev = &ihid->client->dev;
+	int ret;
+
+	dev_info(dev, "waking/resyncing device after idle input\n");
+
+	mutex_lock(&ihid->reset_lock);
+	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
+	mutex_unlock(&ihid->reset_lock);
+
+	if (ret) {
+		dev_warn(dev, "idle input wake failed: %d\n", ret);
+		return;
+	}
+
+	ret = hid_driver_reset_resume(ihid->hid);
+	if (ret)
+		dev_warn(dev, "idle input reset-resume failed: %d\n", ret);
+}
+
+static void i2c_hid_maybe_queue_idle_wake(struct i2c_hid *ihid)
+{
+	unsigned long idle_jiffies;
+	unsigned long now = jiffies;
+	unsigned int actual_idle_ms;
+
+	if (!(ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE))
+		goto update;
+
+	if (!syna_reprobe_after_idle_ms)
+		goto update;
+
+	idle_jiffies = msecs_to_jiffies(syna_reprobe_after_idle_ms);
+	if (time_after(now, ihid->last_input_jiffies + idle_jiffies)) {
+		actual_idle_ms = jiffies_to_msecs(now - ihid->last_input_jiffies);
+		dev_info(&ihid->client->dev,
+			 "input after %u ms idle, threshold %u ms, queuing wake/resync\n",
+			 actual_idle_ms, syna_reprobe_after_idle_ms);
+		schedule_work(&ihid->idle_wake_work);
+	}
+
+update:
+	ihid->last_input_jiffies = now;
+}
+
 static void i2c_hid_get_input(struct i2c_hid *ihid)
 {
 	u16 size = le16_to_cpu(ihid->hdesc.wMaxInputLength);
@@ -560,6 +617,7 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 				      ihid->inbuf + sizeof(__le16),
 				      ihid->bufsize - sizeof(__le16),
 				      ret_size - sizeof(__le16), 1);
+		i2c_hid_maybe_queue_idle_wake(ihid);
 	}
 
 	return;
@@ -999,8 +1057,8 @@ static int i2c_hid_core_resume(struct i2c_hid *ihid)
 	 * data after a suspend/resume.
 	 *
 	 * However some ALPS touchpads generate IRQ storm without reset, so
-	 * let's still reset them here. This standalone tree also uses the same
-	 * reset-on-resume path for SYNA2BA6 to recover lost multitouch gestures.
+	 * let's still reset them here. SYNA2BA6 uses the idle-input wake path
+	 * instead because its failure does not always involve system resume.
 	 */
 	if (ihid->quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
 		mutex_lock(&ihid->reset_lock);
@@ -1015,7 +1073,11 @@ static int i2c_hid_core_resume(struct i2c_hid *ihid)
 	if (ret)
 		return ret;
 
-	return hid_driver_reset_resume(hid);
+	ret = hid_driver_reset_resume(hid);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 /*
@@ -1236,11 +1298,13 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	ihid->client = client;
 	ihid->wHIDDescRegister = cpu_to_le16(hid_descriptor_address);
 	ihid->is_panel_follower = drm_is_panel_follower(&client->dev);
+	ihid->last_input_jiffies = jiffies;
 
 	init_waitqueue_head(&ihid->wait);
 	mutex_init(&ihid->cmd_lock);
 	mutex_init(&ihid->reset_lock);
 	INIT_WORK(&ihid->panel_follower_work, ihid_core_panel_follower_work);
+	INIT_WORK(&ihid->idle_wake_work, i2c_hid_idle_wake_work);
 
 	/* we need to allocate the command buffer without knowing the maximum
 	 * size of the reports. Let's use HID_MIN_BUFFER_SIZE, then we do the
@@ -1310,6 +1374,8 @@ void i2c_hid_core_remove(struct i2c_client *client)
 {
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 	struct hid_device *hid;
+
+	cancel_work_sync(&ihid->idle_wake_work);
 
 	/*
 	 * If we're a follower, the act of unfollowing will cause us to be
