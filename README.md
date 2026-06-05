@@ -1,44 +1,25 @@
 # Standalone I2C HID Modules for SYNA2BA6
 
 This repository builds `i2c_hid` and `i2c_hid_acpi` kernel modules that
-add idle and system-resume wake/resync quirks for the Synaptics I2C HID touchpad
+add wake/resync quirks when idle or system-resume for the Synaptics I2C HID touchpad
 `SYNA2BA6:00 06CB:CF00`.
 
 Attempt to fix: after the system has been idle or suspended, 
 the touchpad still moves the pointer but loses multitouch gestures (e.g. two-finger scroll). 
-The quirk queues a lightweight wake/resync after system resume, and also on the
-first touchpad input after an idle delay (defaults to 100s). The idle delay can
-be tuned with:
+The quirk queues a lightweight wake/resync after system resume from sleep, and on the
+first touchpad input after an idle delay (defaults to 100s). 
 
-```sh
-sudo sh -c 'printf "%s\n" 30000 > /sys/module/i2c_hid/parameters/syna_reprobe_after_idle_ms'
-```
-
-Set it to `0` to disable idle-triggered wake/resync.
-
-The system-resume (post-sleep) trigger is enabled by default. Disable or re-enable with:
-
-```sh
-sudo sh -c 'printf "%s\n" N > /sys/module/i2c_hid/parameters/syna_resync_after_resume'
-sudo sh -c 'printf "%s\n" Y > /sys/module/i2c_hid/parameters/syna_resync_after_resume'
-```
-
-Manually trigger with:
-
-```sh
-sudo sh -c 'printf "%s\n" Y > /sys/module/i2c_hid/parameters/syna_resync_now'
-```
-
-I also include my old fix (rebind device) under [./set-syna-power.sh](./set-syna-power.sh), 
-see script's header for usages.
+I also include my old non-kernel fix (rebind device) under [./set-syna-power.sh](./set-syna-power.sh), 
+see script's header for usages. Note this method introduces a short unresponsive input delay before the device is ready.
 
 ## Credits
-This project is based on the work originally done by
+This project is originally based on the work done by
 [coiby/standalone_i2c_hid](https://github.com/coiby/standalone_i2c_hid), with changes:
 
 - Uses the modern split Linux `drivers/hid/i2c-hid/` layout, with separate
   `i2c_hid` and `i2c_hid_acpi` modules.
 - Trims the HID ID list and DMI quirk hooks to this single device.
+- New tigger logics. New fix route.
 
 This project was created with the help of Codex/GPT-5.5.
 
@@ -47,38 +28,27 @@ This project was created with the help of Codex/GPT-5.5.
 Written for Fedora (7.0.10-201.fc44.x86_64) with Secure Boot, 
 but any distribution should work.
 
-Constraints:
-
-- A built `.ko` only loads into the exact kernel ABI it was built for. The
-  module `vermagic` must match the running kernel.
-- Secure Boot requires locally built modules to be signed with an enrolled key.
-
 ## Check Kernel Headers
 
-Install kernel development files for the exact kernel you want to build for. On
-Fedora this usually means booting the target kernel, then installing matching
-`kernel-devel`.
-
-On other distributions, install the package that provides the build directory
-for the running kernel, usually available through `/lib/modules/$(uname -r)/build`.
+Install kernel development files. 
+On Fedora install `kernel-devel`. On other distros, install `linux-headers`. 
+The package should provide the kernel build directory for the running kernel: `/lib/modules/$(uname -r)/build`.
 
 ## Build
-
-You will likely have to rebuild and optionally re-sign the kernel modules after
-each kernel upgrade.
+You will likely have to rebuild (re-sign) the kernel modules after each kernel upgrade.
 
 ```sh
 cd i2c-hid_standalone
 make
 ```
+Produces `i2c-hid.ko` and `i2c-hid-acpi.ko`.
+
 
 To build against a specific kernel tree:
 
 ```sh
 make KDIR=/usr/src/kernels/$(uname -r)
 ```
-
-Produces `i2c-hid.ko` and `i2c-hid-acpi.ko`.
 
 Clean generated files with:
 
@@ -108,8 +78,7 @@ Enroll the public key once:
 sudo mokutil --import ./MOK.der
 ```
 
-Reboot, then use the MOK manager screen to enroll the key. The enrollment
-survives kernel upgrades.
+Reboot, then use the MOK manager screen to enroll the key. The enrollment survives kernel upgrades.
 
 ### Sign Modules
 
@@ -163,4 +132,26 @@ The expected log includes:
 ```text
 i2c_hid: loading out-of-tree module taints kernel.
 hid-multitouch ... SYNA2BA6:00 06CB:CF00 ... on i2c-SYNA2BA6:00
+```
+
+## Parameters
+The idle delay can be tuned with:
+
+```sh
+sudo sh -c 'printf "%s\n" 30000 > /sys/module/i2c_hid/parameters/syna_reprobe_after_idle_ms'
+```
+
+Set it to `0` to disable idle-triggered wake/resync.
+
+The system-resume (post-sleep) trigger is enabled by default. Disable or re-enable with:
+
+```sh
+sudo sh -c 'printf "%s\n" N > /sys/module/i2c_hid/parameters/syna_resync_after_resume'
+sudo sh -c 'printf "%s\n" Y > /sys/module/i2c_hid/parameters/syna_resync_after_resume'
+```
+
+Manually trigger with:
+
+```sh
+sudo sh -c 'printf "%s\n" Y > /sys/module/i2c_hid/parameters/syna_resync_now'
 ```
