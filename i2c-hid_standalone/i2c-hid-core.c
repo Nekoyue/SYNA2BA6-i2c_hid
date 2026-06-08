@@ -68,7 +68,7 @@
 static LIST_HEAD(syna_resync_devices);
 static DEFINE_MUTEX(syna_resync_devices_lock);
 
-static unsigned int syna_reprobe_after_idle_ms = 100000;
+static unsigned int syna_reprobe_after_idle_ms = 60000;
 module_param(syna_reprobe_after_idle_ms, uint, 0644);
 MODULE_PARM_DESC(syna_reprobe_after_idle_ms,
 		 "Queue a SYNA2BA6 wake/resync on first input after this idle time in ms, 0 disables");

@@ -7,7 +7,7 @@ add wake/resync quirks when idle or system-resume for the Synaptics I2C HID touc
 Attempt to fix: after the system has been idle or suspended, 
 the touchpad still moves the pointer but loses multitouch gestures (e.g. two-finger scroll). 
 The quirk queues a lightweight wake/resync after system resume from sleep, and on the
-first touchpad input after an idle delay (defaults to 100s). 
+first touchpad input after an idle delay (defaults to 60s). 
 
 I also include my old non-kernel fix (rebind device) under [./set-syna-power.sh](./set-syna-power.sh), 
 see script's header for usages. Note this method introduces a short unresponsive input delay before the device is ready.
