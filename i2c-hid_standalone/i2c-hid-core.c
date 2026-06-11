@@ -68,7 +68,7 @@
 static LIST_HEAD(syna_resync_devices);
 static DEFINE_MUTEX(syna_resync_devices_lock);
 
-static unsigned int syna_reprobe_after_idle_ms = 60000;
+static unsigned int syna_reprobe_after_idle_ms = 30000;
 module_param(syna_reprobe_after_idle_ms, uint, 0644);
 MODULE_PARM_DESC(syna_reprobe_after_idle_ms,
 		 "Queue a SYNA2BA6 wake/resync on first input after this idle time in ms, 0 disables");
@@ -518,6 +518,19 @@ static void i2c_hid_queue_syna_resync(struct i2c_hid *ihid)
 		return;
 
 	schedule_work(&ihid->idle_wake_work);
+}
+
+static void i2c_hid_queue_syna_resume_resync(struct i2c_hid *ihid)
+{
+	if (!syna_resync_after_resume)
+		return;
+
+	if (!(ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE))
+		return;
+
+	dev_info(&ihid->client->dev,
+		 "system resume complete, queuing Synaptics wake/resync\n");
+	i2c_hid_queue_syna_resync(ihid);
 }
 
 static int param_set_syna_resync_now(const char *val,
@@ -1021,13 +1034,6 @@ static int i2c_hid_core_resume(struct i2c_hid *ihid)
 	if (ret)
 		return ret;
 
-	if (syna_resync_after_resume &&
-	    ihid->quirks & I2C_HID_QUIRK_WAKE_AFTER_IDLE) {
-		dev_info(&ihid->client->dev,
-			 "system resumed, queuing Synaptics wake/resync\n");
-		i2c_hid_queue_syna_resync(ihid);
-	}
-
 	return 0;
 }
 
@@ -1236,6 +1242,14 @@ static int i2c_hid_core_pm_restore(struct device *dev)
 	return i2c_hid_core_resume(ihid);
 }
 
+static void i2c_hid_core_pm_complete(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct i2c_hid *ihid = i2c_get_clientdata(client);
+
+	i2c_hid_queue_syna_resume_resync(ihid);
+}
+
 const struct dev_pm_ops i2c_hid_core_pm = {
 	.suspend = pm_sleep_ptr(i2c_hid_core_pm_suspend),
 	.resume = pm_sleep_ptr(i2c_hid_core_pm_resume),
@@ -1243,6 +1257,7 @@ const struct dev_pm_ops i2c_hid_core_pm = {
 	.thaw = pm_sleep_ptr(i2c_hid_core_pm_resume),
 	.poweroff = pm_sleep_ptr(i2c_hid_core_pm_suspend),
 	.restore = pm_sleep_ptr(i2c_hid_core_pm_restore),
+	.complete = pm_sleep_ptr(i2c_hid_core_pm_complete),
 };
 EXPORT_SYMBOL_GPL(i2c_hid_core_pm);
 

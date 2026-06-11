@@ -29,6 +29,7 @@ set -euo pipefail
 
 device="i2c-SYNA2BA6:00"
 driver="/sys/bus/i2c/drivers/i2c_hid_acpi"
+manual_resync="/sys/module/i2c_hid/parameters/syna_resync_now"
 
 log() {
   local message="$*"
@@ -41,6 +42,13 @@ log() {
 }
 
 main() {
+  if [[ -e "$manual_resync" ]]; then
+    log "triggering manual Synaptics wake/resync via $manual_resync"
+    printf '%s\n' Y > "$manual_resync"
+    log "finished manual Synaptics wake/resync trigger"
+    return
+  fi
+
   if [[ ! -d "$driver" ]]; then
     log "missing driver path: $driver"
     exit 1
