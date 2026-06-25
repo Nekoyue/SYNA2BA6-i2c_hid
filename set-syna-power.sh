@@ -12,7 +12,7 @@
 # [Service]
 # User=root
 # Type=simple
-# ExecStart=/usr/local/bin/set-syna-power.sh
+# ExecStart=/usr/local/bin/set-syna-power.sh --rebind
 
 # [Install]
 # WantedBy=suspend.target
@@ -23,6 +23,9 @@
 ## /etc/keyd/default.conf
 # [meta+shift]
 # f23 = command(/usr/local/bin/set-syna-power.sh)
+#
+## Force the older driver unbind/bind path even when manual resync is available:
+# /usr/local/bin/set-syna-power.sh --rebind
 
 
 set -euo pipefail
@@ -42,7 +45,22 @@ log() {
 }
 
 main() {
-  if [[ -e "$manual_resync" ]]; then
+  local rebind=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rebind)
+        rebind=true
+        ;;
+      *)
+        log "unknown argument: $1"
+        exit 2
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "$rebind" == false && -e "$manual_resync" ]]; then
     log "triggering manual Synaptics wake/resync via $manual_resync"
     printf '%s\n' Y > "$manual_resync"
     log "finished manual Synaptics wake/resync trigger"
