@@ -15,8 +15,8 @@
 # [meta+shift]
 # f23 = command(/usr/local/bin/set-syna-power.sh)
 
-## As a systemd service (stock modules only; the custom module already
-## resyncs on resume, see syna_resync_after_resume). This only fixes issues
+## As a systemd service (stock modules only; the custom module reconfigures the
+## touchpad itself, see the README). This only fixes issues
 ## when resuming from sleep, not the touchpad breaking after idle.
 ## /etc/systemd/system/touchpad-after-wake-fix.service
 # [Unit]

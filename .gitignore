@@ -8,6 +8,6 @@
 Module.symvers
 modules.order
 
-# syna-debug.sh captures
+# debug captures (see ROOT-CAUSE.md)
 syna-debug-*.log
 syna-record-*.yml
