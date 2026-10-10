@@ -5,8 +5,9 @@
 ## Usage (as root):
 ##   syna-debug.sh observe          turn the resync quirk off so the bug shows
 ##                                  up unmodified; debug logging stays on
-##   syna-debug.sh fix-test         quirk off, but resync whenever the device
-##                                  resets itself (candidate root-cause fix)
+##   syna-debug.sh fix-test         quirk off, but resync as soon as the device
+##                                  sends a mouse-mode report or resets itself
+##                                  (candidate root-cause fix)
 ##   syna-debug.sh restore          back to the default quirk settings
 ##   syna-debug.sh mark [note...]   log a note, counters and a feature dump
 ##   syna-debug.sh resync           recover the touchpad (manual resync)
@@ -38,7 +39,8 @@ show_status() {
   local p
 
   for p in syna_resync_after_idle_ms syna_resync_after_resume \
-           syna_dbg_resync_on_reset syna_dbg_gap_ms syna_dbg_poll_ms; do
+           syna_dbg_resync_on_reset syna_dbg_resync_on_mouse \
+           syna_dbg_gap_ms syna_dbg_poll_ms; do
     printf '%-28s %s\n' "$p" "$(cat "$params/$p")"
   done
   printf '\n'
@@ -72,18 +74,21 @@ main() {
       set_param syna_resync_after_idle_ms 0
       set_param syna_resync_after_resume N
       set_param syna_dbg_resync_on_reset N
+      set_param syna_dbg_resync_on_mouse N
       show_status
       ;;
     fix-test)
       set_param syna_resync_after_idle_ms 0
       set_param syna_resync_after_resume N
       set_param syna_dbg_resync_on_reset Y
+      set_param syna_dbg_resync_on_mouse Y
       show_status
       ;;
     restore)
       set_param syna_resync_after_idle_ms 30000
       set_param syna_resync_after_resume Y
       set_param syna_dbg_resync_on_reset N
+      set_param syna_dbg_resync_on_mouse N
       set_param syna_dbg_poll_ms 0
       show_status
       ;;

@@ -96,6 +96,7 @@ struct i2c_hid_syna_dbg {
 	unsigned long		id_switches;
 	unsigned long		idle_gaps;
 	unsigned long		resyncs;
+	unsigned long		last_mouse_resync;	/* jiffies */
 
 	u8			last_id;		/* last input report ID */
 	u8			last_report[32];	/* last input report */
@@ -656,6 +657,8 @@ MODULE_PARM_DESC(syna_resync_now,
  */
 #define SYNA_DBG_ID_MOUSE	0x02
 #define SYNA_DBG_ID_TOUCHPAD	0x03
+#define SYNA_DBG_ID_RMI_DATA	0x0b
+#define SYNA_DBG_ID_RMI_ATTN	0x0c
 #define SYNA_DBG_FEATURE_MAX	64
 
 static unsigned int syna_dbg_gap_ms = 5000;
@@ -667,6 +670,11 @@ static bool syna_dbg_resync_on_reset;
 module_param(syna_dbg_resync_on_reset, bool, 0644);
 MODULE_PARM_DESC(syna_dbg_resync_on_reset,
 		 "Queue a resync when the device resets itself (candidate root-cause fix)");
+
+static bool syna_dbg_resync_on_mouse;
+module_param(syna_dbg_resync_on_mouse, bool, 0644);
+MODULE_PARM_DESC(syna_dbg_resync_on_mouse,
+		 "Queue a resync when a mouse-mode report arrives (candidate root-cause fix)");
 
 static unsigned int syna_dbg_poll_ms;
 
@@ -704,6 +712,12 @@ static const char *i2c_hid_syna_dbg_id_name(u8 id)
 		return "mouse";
 	case SYNA_DBG_ID_TOUCHPAD:
 		return "touchpad";
+	case SYNA_DBG_ID_RMI_DATA:
+		return "rmi data";
+	case SYNA_DBG_ID_RMI_ATTN:
+		return "rmi attention";
+	case 0x00:
+		return "no id";
 	default:
 		return "other";
 	}
@@ -880,9 +894,26 @@ static void i2c_hid_syna_dbg_input(struct i2c_hid *ihid, const u8 *data,
 				     dbg->last_id,
 				     i2c_hid_syna_dbg_id_name(dbg->last_id),
 				     id, i2c_hid_syna_dbg_id_name(id), gap_ms);
-		if (id == SYNA_DBG_ID_MOUSE)
+		if (id == SYNA_DBG_ID_MOUSE && !syna_dbg_resync_on_mouse)
 			i2c_hid_syna_dbg_queue_dump(ihid,
 						    "switched to mouse reports");
+	}
+
+	if (id != SYNA_DBG_ID_MOUSE && id != SYNA_DBG_ID_TOUCHPAD)
+		dev_info_ratelimited(dev, "syna-dbg: report 0x%02x (%s), %u bytes, %u ms after previous input: %*ph\n",
+				     id, i2c_hid_syna_dbg_id_name(id), len,
+				     gap_ms, shown, data);
+
+	/*
+	 * In touchpad mode the device never sends mouse reports, so one means
+	 * the firmware has re-initialized into its default mouse mode. Hold
+	 * off for a second so reports still in flight do not re-queue it.
+	 */
+	if (id == SYNA_DBG_ID_MOUSE && syna_dbg_resync_on_mouse &&
+	    time_after(jiffies, dbg->last_mouse_resync + HZ)) {
+		dbg->last_mouse_resync = jiffies;
+		dev_info(dev, "syna-dbg: mouse-mode report, queuing Synaptics resync\n");
+		i2c_hid_queue_syna_resync(ihid);
 	}
 
 	dbg->last_id = id;
@@ -1558,6 +1589,7 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	ihid->client = client;
 	ihid->wHIDDescRegister = cpu_to_le16(hid_descriptor_address);
 	ihid->last_input_jiffies = jiffies;
+	ihid->syna_dbg.last_mouse_resync = jiffies - HZ;
 
 	init_waitqueue_head(&ihid->wait);
 	mutex_init(&ihid->cmd_lock);

@@ -7,3 +7,7 @@
 *.priv
 Module.symvers
 modules.order
+
+# syna-debug.sh captures
+syna-debug-*.log
+syna-record-*.yml

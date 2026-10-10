@@ -26,6 +26,37 @@ Report IDs come from this device's report descriptor:
 | `0x06` | feature | Surface switch / button switch |
 | `0x0d` | feature | Latency mode |
 
+## Findings So Far
+
+**2026-10-10, first capture** (`observe` mode, quirk off):
+
+```text
+13:20:09  touchpad reports (0x03), healthy
+          ... 29.5 s without touch ...
+13:20:39  first packet after idle: 13 zero bytes (report ID 0x00)
+          then RMI attention report 0x0c: 0c 02 01 00 ...
+13:21:05  only mouse reports (0x02) from here on
+13:21:37  manual resync -> touchpad reports again at 13:21:39
+```
+
+- **A confirmed, B ruled out (this occurrence).** During the broken window,
+  `libinput record` saw 1,483 `REL_X/REL_Y` events on the Mouse node and none on the
+  Touchpad node.
+- **The firmware re-initializes after about 30 s without touch** and comes back in its
+  default mouse mode.
+- **No spec-style reset signal:** `unsolicited_resets=0`. The firmware announces the reset
+  differently, with an all-zero packet followed by an RMI attention report. This touchpad
+  also exposes Synaptics' RMI-over-HID channel (reports `0x09`-`0x0c`, plus feature
+  `0x0f`, the same IDs as `hid-rmi`), which `hid-multitouch` ignores.
+- **No mouse reports in healthy mode.** All 8,272 touchpad reports came before the reset.
+  A mouse report is therefore a reliable signal that the mode was lost.
+- **`GET_REPORT` always NACKs (`-121`)**, even right after a resync, while `SET_REPORT`
+  works. This firmware probably doesn't support reading features back, so the feature
+  dumps carry no information.
+
+Open questions: does every mouse-mode switch come with the zero packet and `0x0c`? And
+does resyncing on the first mouse report (`fix-test`) fix the bug for good?
+
 ## What Gets Logged
 
 All lines start with `syna-dbg:`. To follow them live: `journalctl -kf | grep syna-dbg`.
@@ -40,13 +71,16 @@ All lines start with `syna-dbg:`. To follow them live: `journalctl -kf | grep sy
   device-initiated reset and on a switch to mouse mode.
 - **Suspend/resume:** the result of each `SET_POWER` and `reset_resume` call.
 - **Input read errors:** these were silent before.
+- **Reports other than touchpad/mouse:** for example the zero packet or the RMI
+  attention report, with their raw bytes.
 
 New parameters, all under `/sys/module/i2c_hid/parameters/`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
 | `syna_dbg_gap_ms` | `5000` | Idle-gap logging threshold, `0` disables |
-| `syna_dbg_resync_on_reset` | `N` | Resync on a device-initiated reset (candidate fix) |
+| `syna_dbg_resync_on_reset` | `N` | Resync on a spec-style device-initiated reset |
+| `syna_dbg_resync_on_mouse` | `N` | Resync on the first mouse-mode report (candidate fix) |
 | `syna_dbg_poll_ms` | `0` | Read Input Mode every N ms and log changes |
 | `syna_dbg_mark` | – | Write a note: logs it with counters and a feature dump |
 | `syna_dbg_stats` | – | Read-only counters |
@@ -103,15 +137,15 @@ low-power state.
 
 ### 3. Test the candidate fix
 
-Do this only if phase 1 shows device-initiated resets:
-
 ```sh
 sudo ./syna-debug.sh fix-test
 ```
 
-The idle and resume triggers are off, so the only recovery left is a resync when the
-device announces a reset. If gestures survive a few days of normal use, that is the
-root-cause fix, and it can replace the idle timer on `master`.
+The idle and resume triggers are off. The only recovery left is a resync on the first
+mouse-mode report (or on a spec-style reset). Expect at most a few pixels of pointer
+movement before gestures come back, and look for `mouse-mode report, queuing Synaptics
+resync` in the log. If gestures survive a few days of normal use, including suspend,
+this trigger can replace the idle timer on `master`.
 
 ### Back to normal
 
