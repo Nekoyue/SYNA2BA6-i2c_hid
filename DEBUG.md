@@ -54,8 +54,29 @@ Report IDs come from this device's report descriptor:
   works. This firmware probably doesn't support reading features back, so the feature
   dumps carry no information.
 
-Open questions: does every mouse-mode switch come with the zero packet and `0x0c`? And
-does resyncing on the first mouse report (`fix-test`) fix the bug for good?
+**2026-10-10, second capture** (`fix-test` with resync on mouse report, 45 min, on
+battery):
+
+- **No visible breakage.** 5 mouse-mode switches, each fixed within about 60 ms
+  (67 mouse reports in total).
+- **The reset announcement is always the same:** a 13-byte all-zero packet, then 2 ms
+  later `0c 02 01 00 ...`. It appeared 11 times, and all 5 mouse-mode switches came
+  after one. In RMI4 terms, `02 01` reads as "F01 interrupt, device status = reset
+  occurred".
+- **The resets happen without touch.** The first one in a chain comes about 25-30 s
+  after the last touch. Mouse reports then follow 7-21 s later, when you next touch the
+  pad. While the device stays unconfigured, it keeps resetting every 24-200 s
+  (13:49-13:56: five resets with no input in between).
+- **Not every long idle triggers it.** Gaps of 46-128 s often passed without a reset.
+- **No system event correlates** with the resets in the journal (nothing within 15 s),
+  and the I2C controller runtime-suspends after every 1 s of inactivity anyway. This
+  looks internal to the firmware.
+
+**Conclusion:** the firmware resets itself and announces it in a non-standard way that
+Linux ignores, so nobody re-sends Input Mode. The root-cause fix at the driver level is
+to treat that announcement as the device-initiated reset it is, and reconfigure the
+device straight away. `syna_dbg_resync_on_reset` now does this, with the mouse-report
+trigger kept as a safety net.
 
 ## What Gets Logged
 
@@ -79,8 +100,8 @@ New parameters, all under `/sys/module/i2c_hid/parameters/`:
 | Parameter | Default | Purpose |
 |---|---|---|
 | `syna_dbg_gap_ms` | `5000` | Idle-gap logging threshold, `0` disables |
-| `syna_dbg_resync_on_reset` | `N` | Resync on a spec-style device-initiated reset |
-| `syna_dbg_resync_on_mouse` | `N` | Resync on the first mouse-mode report (candidate fix) |
+| `syna_dbg_resync_on_reset` | `N` | Resync when the device announces a reset: zero-length report, all-zero packet, or `0c 02 01` (root-cause fix) |
+| `syna_dbg_resync_on_mouse` | `N` | Resync on the first mouse-mode report (safety net) |
 | `syna_dbg_poll_ms` | `0` | Read Input Mode every N ms and log changes |
 | `syna_dbg_mark` | – | Write a note: logs it with counters and a feature dump |
 | `syna_dbg_stats` | – | Read-only counters |
@@ -141,11 +162,12 @@ low-power state.
 sudo ./syna-debug.sh fix-test
 ```
 
-The idle and resume triggers are off. The only recovery left is a resync on the first
-mouse-mode report (or on a spec-style reset). Expect at most a few pixels of pointer
-movement before gestures come back, and look for `mouse-mode report, queuing Synaptics
-resync` in the log. If gestures survive a few days of normal use, including suspend,
-this trigger can replace the idle timer on `master`.
+The idle and resume triggers are off. The device is reconfigured as soon as it
+announces a reset, usually while you aren't touching it, so there should be no pointer
+jump at all. Look for `device-initiated reset (zero packet)` followed by `resyncing
+Synaptics device`. `mouse-mode report, queuing Synaptics resync` should now be rare or
+absent, and `mouse=` in the counters should stay at or near 0. If gestures survive a
+few days of normal use, including suspend, this replaces the idle timer on `master`.
 
 ### Back to normal
 

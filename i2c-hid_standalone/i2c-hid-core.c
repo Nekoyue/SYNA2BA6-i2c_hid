@@ -96,7 +96,7 @@ struct i2c_hid_syna_dbg {
 	unsigned long		id_switches;
 	unsigned long		idle_gaps;
 	unsigned long		resyncs;
-	unsigned long		last_mouse_resync;	/* jiffies */
+	unsigned long		last_auto_resync;	/* jiffies, for holdoff */
 
 	u8			last_id;		/* last input report ID */
 	u8			last_report[32];	/* last input report */
@@ -669,12 +669,12 @@ MODULE_PARM_DESC(syna_dbg_gap_ms,
 static bool syna_dbg_resync_on_reset;
 module_param(syna_dbg_resync_on_reset, bool, 0644);
 MODULE_PARM_DESC(syna_dbg_resync_on_reset,
-		 "Queue a resync when the device resets itself (candidate root-cause fix)");
+		 "Queue a resync when the device announces it reset itself (root-cause fix)");
 
 static bool syna_dbg_resync_on_mouse;
 module_param(syna_dbg_resync_on_mouse, bool, 0644);
 MODULE_PARM_DESC(syna_dbg_resync_on_mouse,
-		 "Queue a resync when a mouse-mode report arrives (candidate root-cause fix)");
+		 "Queue a resync when a mouse-mode report arrives (safety net)");
 
 static unsigned int syna_dbg_poll_ms;
 
@@ -850,6 +850,61 @@ static int i2c_hid_syna_dbg_format_stats(struct i2c_hid *ihid, char *buf,
 			 jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
 }
 
+/*
+ * Automatic resyncs share a one second holdoff, so the two packets of a reset
+ * announcement or a burst of mouse reports queue only one resync.
+ */
+static bool i2c_hid_syna_dbg_in_holdoff(struct i2c_hid *ihid)
+{
+	struct i2c_hid_syna_dbg *dbg = &ihid->syna_dbg;
+
+	if (time_before(jiffies, dbg->last_auto_resync + HZ))
+		return true;
+
+	dbg->last_auto_resync = jiffies;
+	return false;
+}
+
+/*
+ * The device reset itself. The HID over I2C spec announces this with a
+ * zero-length input report; this firmware instead sends an all-zero packet
+ * without a report ID, followed 2 ms later by RMI attention report
+ * "0c 02 01" (F01 interrupt, device status "reset occurred"). Either way it
+ * is back in its default mouse mode.
+ */
+static void i2c_hid_syna_dbg_unsolicited_reset(struct i2c_hid *ihid,
+					       const char *how)
+{
+	struct device *dev = &ihid->client->dev;
+
+	if (!(ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC))
+		return;
+
+	if (i2c_hid_syna_dbg_in_holdoff(ihid))
+		return;
+
+	ihid->syna_dbg.unsolicited_resets++;
+	dev_warn_ratelimited(dev, "syna-dbg: device-initiated reset (%s), last input %u ms ago\n",
+			     how,
+			     jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
+
+	if (syna_dbg_resync_on_reset) {
+		dev_info(dev, "syna-dbg: queuing Synaptics resync after device-initiated reset\n");
+		i2c_hid_queue_syna_resync(ihid);
+	} else {
+		i2c_hid_syna_dbg_queue_dump(ihid, "after device-initiated reset");
+	}
+}
+
+static bool i2c_hid_syna_dbg_is_reset_packet(const u8 *data, u16 len)
+{
+	if (len >= 3 && data[0] == SYNA_DBG_ID_RMI_ATTN &&
+	    data[1] == 0x02 && data[2] == 0x01)
+		return true;
+
+	return len && !memchr_inv(data, 0, len);
+}
+
 /* Called for every input report, before i2c_hid_syna_idle_resync(). */
 static void i2c_hid_syna_dbg_input(struct i2c_hid *ihid, const u8 *data,
 				   u16 len)
@@ -909,9 +964,12 @@ static void i2c_hid_syna_dbg_input(struct i2c_hid *ihid, const u8 *data,
 	 * the firmware has re-initialized into its default mouse mode. Hold
 	 * off for a second so reports still in flight do not re-queue it.
 	 */
+	if (i2c_hid_syna_dbg_is_reset_packet(data, len))
+		i2c_hid_syna_dbg_unsolicited_reset(ihid,
+						   id ? "rmi attention" : "zero packet");
+
 	if (id == SYNA_DBG_ID_MOUSE && syna_dbg_resync_on_mouse &&
-	    time_after(jiffies, dbg->last_mouse_resync + HZ)) {
-		dbg->last_mouse_resync = jiffies;
+	    !i2c_hid_syna_dbg_in_holdoff(ihid)) {
 		dev_info(dev, "syna-dbg: mouse-mode report, queuing Synaptics resync\n");
 		i2c_hid_queue_syna_resync(ihid);
 	}
@@ -919,26 +977,6 @@ static void i2c_hid_syna_dbg_input(struct i2c_hid *ihid, const u8 *data,
 	dbg->last_id = id;
 	memcpy(dbg->last_report, data, shown);
 	dbg->last_len = shown;
-}
-
-/* Zero-length input report while no host-initiated reset is pending. */
-static void i2c_hid_syna_dbg_unsolicited_reset(struct i2c_hid *ihid)
-{
-	struct device *dev = &ihid->client->dev;
-
-	if (!(ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC))
-		return;
-
-	ihid->syna_dbg.unsolicited_resets++;
-	dev_warn_ratelimited(dev, "syna-dbg: device-initiated reset (zero-length input report, no reset pending), last input %u ms ago\n",
-			     jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
-
-	if (syna_dbg_resync_on_reset) {
-		dev_info(dev, "syna-dbg: queuing Synaptics resync after device-initiated reset\n");
-		i2c_hid_queue_syna_resync(ihid);
-	} else {
-		i2c_hid_syna_dbg_queue_dump(ihid, "after device-initiated reset");
-	}
 }
 
 static void i2c_hid_syna_dbg_recv_error(struct i2c_hid *ihid, int error)
@@ -1065,7 +1103,8 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		if (test_and_clear_bit(I2C_HID_RESET_PENDING, &ihid->flags))
 			wake_up(&ihid->wait);
 		else
-			i2c_hid_syna_dbg_unsolicited_reset(ihid);
+			i2c_hid_syna_dbg_unsolicited_reset(ihid,
+							   "zero-length report");
 		return;
 	}
 
@@ -1589,7 +1628,7 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	ihid->client = client;
 	ihid->wHIDDescRegister = cpu_to_le16(hid_descriptor_address);
 	ihid->last_input_jiffies = jiffies;
-	ihid->syna_dbg.last_mouse_resync = jiffies - HZ;
+	ihid->syna_dbg.last_auto_resync = jiffies - HZ;
 
 	init_waitqueue_head(&ihid->wait);
 	mutex_init(&ihid->cmd_lock);
