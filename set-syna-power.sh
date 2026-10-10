@@ -1,9 +1,23 @@
 #!/usr/bin/env bash
 
+## Recover the SYNA2BA6 touchpad when multitouch gestures stop working.
 ## Place the script under `/usr/local/bin/set-syna-power.sh`
+##
+## Usage:
+##   set-syna-power.sh            resync via the custom i2c_hid module's
+##                                syna_resync_now parameter if it is loaded,
+##                                otherwise fall back to unbind/bind
+##   set-syna-power.sh --rebind   always unbind/bind the device (works with
+##                                the stock modules, but input stalls briefly)
 
-## As a systemd service: this only fix issues when resuming from sleep
-## (not touchpad broken after idle)
+## keyd to bind to the Copilot key:
+## /etc/keyd/default.conf
+# [meta+shift]
+# f23 = command(/usr/local/bin/set-syna-power.sh)
+
+## As a systemd service (stock modules only; the custom module already
+## resyncs on resume, see syna_resync_after_resume). This only fixes issues
+## when resuming from sleep, not the touchpad breaking after idle.
 ## /etc/systemd/system/touchpad-after-wake-fix.service
 # [Unit]
 # Description=Restart touchpad on resume
@@ -18,14 +32,6 @@
 # WantedBy=suspend.target
 # WantedBy=exit.target
 # WantedBy=default.target
-
-## keyd to bind to the Copilot key:
-## /etc/keyd/default.conf
-# [meta+shift]
-# f23 = command(/usr/local/bin/set-syna-power.sh)
-#
-## Force the older driver unbind/bind path even when manual resync is available:
-# /usr/local/bin/set-syna-power.sh --rebind
 
 
 set -euo pipefail

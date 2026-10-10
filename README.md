@@ -1,49 +1,58 @@
 # Standalone I2C HID Modules for SYNA2BA6
 
-This repository builds `i2c_hid` and `i2c_hid_acpi` kernel modules that
-add wake/resync quirks when idle or after system-resume for the Synaptics I2C HID touchpad
-`SYNA2BA6:00 06CB:CF00`.
+Out-of-tree `i2c_hid` and `i2c_hid_acpi` kernel modules with a resync quirk for the
+Synaptics I2C HID touchpad `SYNA2BA6:00 06CB:CF00`.
 
-Attempt to fix: after the system has been idle or suspended, 
-the touchpad still moves the pointer but loses multitouch gestures (e.g. two-finger scroll). 
-The quirk queues a lightweight wake/resync from the kernel PM `complete` phase after
-system resume from sleep, and on the first touchpad input after an idle delay (defaults
-to 30s).
+**Problem:** after the system has been idle or suspended, the touchpad still moves the
+pointer but loses multitouch gestures (e.g. two-finger scroll).
 
-I also include my old non-kernel fix (rebind device) under [./set-syna-power.sh](./set-syna-power.sh), 
-see script's header for usages. Note this method introduces a short unresponsive input delay before the device is ready.
+**Fix attempt:** resync the touchpad automatically after idle and after system resume,
+or manually on demand.
 
-## Credits
-This project is originally based on the work done by
-[coiby/standalone_i2c_hid](https://github.com/coiby/standalone_i2c_hid), with changes:
+## How It Works
 
-- Uses the modern split Linux `drivers/hid/i2c-hid/` layout, with separate
-  `i2c_hid` and `i2c_hid_acpi` modules.
-- Trims the HID ID list and DMI quirk hooks to this single device.
-- New tigger logics. New fix route.
+A resync sends `SET_POWER(ON)` to the device, then runs the HID driver's
+`reset_resume()` hook. For `hid-multitouch` that releases all contacts and re-sends the
+Input Mode feature report, which switches the touchpad back into multitouch mode. The
+device is not reset, re-probed or rebound.
 
-This project was created with the help of Codex/GPT-5.5.
+A resync is queued by any of these triggers:
+
+| Trigger | When | Parameter |
+|---|---|---|
+| Idle | First touchpad input after an idle gap (default 30 s) | `syna_resync_after_idle_ms` |
+| Resume | Kernel PM `complete` phase after system sleep | `syna_resync_after_resume` |
+| Manual | Writing `Y` to the parameter | `syna_resync_now` |
+
+All quirk code lives in the "Synaptics SYNA2BA6 resync" section of
+[`i2c-hid_standalone/i2c-hid-core.c`](./i2c-hid_standalone/i2c-hid-core.c).
+
+## Repository Layout
+
+```text
+i2c-hid_standalone/   kernel module sources (i2c-hid-core.c holds the quirk)
+set-syna-power.sh     helper: manual resync, or unbind/bind with the stock modules
+```
 
 ## Tested Environment
 
-Written for Fedora (7.0.10-201.fc44.x86_64) with Secure Boot, 
-but any distribution should work.
+Written for Fedora with Secure Boot, but any distribution should work. Tested on:
 
-## Check Kernel Headers
-
-Install kernel development files. 
-On Fedora install `kernel-devel`. On other distros, install `linux-headers`. 
-The package should provide the kernel build directory for the running kernel: `/lib/modules/$(uname -r)/build`.
+- `7.0.10-201.fc44.x86_64`
+- `7.2.7-200.fc44.x86_64`
 
 ## Build
-You will likely have to rebuild (re-sign) the kernel modules after each kernel upgrade.
+
+Install kernel development files: `kernel-devel` on Fedora, `linux-headers` on other
+distros. They must provide `/lib/modules/$(uname -r)/build`.
 
 ```sh
 cd i2c-hid_standalone
 make
 ```
-Produces `i2c-hid.ko` and `i2c-hid-acpi.ko`.
 
+This produces `i2c-hid.ko` and `i2c-hid-acpi.ko`. You will likely have to rebuild (and
+re-sign) after each kernel upgrade.
 
 To build against a specific kernel tree:
 
@@ -51,11 +60,7 @@ To build against a specific kernel tree:
 make KDIR=/usr/src/kernels/$(uname -r)
 ```
 
-Clean generated files with:
-
-```sh
-make clean
-```
+Clean generated files with `make clean`.
 
 ## Secure Boot (if enabled)
 
@@ -73,13 +78,14 @@ openssl req -new -x509 -newkey rsa:2048 \
   -subj "/CN=Local i2c-hid module signing/"
 ```
 
-Enroll the public key once:
+Enroll the public key:
 
 ```sh
 sudo mokutil --import ./MOK.der
 ```
 
-Reboot, then use the MOK manager screen to enroll the key. The enrollment survives kernel upgrades.
+Reboot, then use the MOK manager screen to enroll the key. The enrollment survives
+kernel upgrades.
 
 ### Sign Modules
 
@@ -99,7 +105,7 @@ modinfo ./i2c-hid.ko | grep -E '^(name|vermagic|sig_id|signer|sig_hashalgo):'
 modinfo ./i2c-hid-acpi.ko | grep -E '^(name|vermagic|sig_id|signer|sig_hashalgo):'
 ```
 
-## Load Kernel Modules
+## Load
 
 Unload the in-tree modules and insert the local pair:
 
@@ -116,10 +122,10 @@ sudo modprobe -r i2c_hid_acpi i2c_hid
 sudo modprobe i2c_hid_acpi
 ```
 
-For frequent kernel updates, prefer an akmods/DKMS package over manually replacing files 
-under `/lib/modules/<kernel>/` instead.
+For frequent kernel updates, prefer an akmods/DKMS package over manually replacing
+files under `/lib/modules/<kernel>/`.
 
-### Verify with dmesg
+### Verify
 
 Check that the out-of-tree module loaded and the touchpad re-enumerated:
 
@@ -135,25 +141,47 @@ i2c_hid: loading out-of-tree module taints kernel.
 hid-multitouch ... SYNA2BA6:00 06CB:CF00 ... on i2c-SYNA2BA6:00
 ```
 
+Each resync logs `resyncing Synaptics device`, preceded by a line naming the trigger.
+
 ## Parameters
-The idle delay can be tuned with:
+
+All parameters live under `/sys/module/i2c_hid/parameters/`.
+
+Idle threshold in ms (default `30000`, `0` disables the idle trigger):
 
 ```sh
-sudo sh -c 'printf "%s\n" 30000 > /sys/module/i2c_hid/parameters/syna_reprobe_after_idle_ms'
+sudo sh -c 'printf "%s\n" 30000 > /sys/module/i2c_hid/parameters/syna_resync_after_idle_ms'
 ```
 
-Set it to `0` to disable idle-triggered wake/resync.
-
-The system-resume trigger runs in the kernel PM `complete` phase and is enabled by
-default. Disable or re-enable with:
+Resync after system resume (default `Y`):
 
 ```sh
 sudo sh -c 'printf "%s\n" N > /sys/module/i2c_hid/parameters/syna_resync_after_resume'
 sudo sh -c 'printf "%s\n" Y > /sys/module/i2c_hid/parameters/syna_resync_after_resume'
 ```
 
-Manually trigger with:
+Manual resync:
 
 ```sh
 sudo sh -c 'printf "%s\n" Y > /sys/module/i2c_hid/parameters/syna_resync_now'
 ```
+
+## Helper Script
+
+[`set-syna-power.sh`](./set-syna-power.sh) triggers a manual resync when the custom
+module is loaded. Otherwise it falls back to my older fix, which unbinds and rebinds the
+device and works with the stock modules. `--rebind` always uses the unbind/bind path.
+Unbind/bind leaves input unresponsive for a moment while the device comes back. The
+script header has example keyd and systemd configurations.
+
+## Credits
+
+Originally based on [coiby/standalone_i2c_hid](https://github.com/coiby/standalone_i2c_hid),
+with these changes:
+
+- Uses the modern split Linux `drivers/hid/i2c-hid/` layout, with separate `i2c_hid`
+  and `i2c_hid_acpi` modules.
+- Trims the HID ID list and DMI quirk hooks to this single device.
+- New trigger logic and recovery path.
+
+This project was created with the help of Codex/GPT-5.5 and Claude Code/Claude Opus 5.5.
