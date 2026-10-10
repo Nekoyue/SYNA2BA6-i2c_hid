@@ -82,6 +82,28 @@ struct i2c_hid_desc {
 	__le32 reserved;
 } __packed;
 
+/* SYNA2BA6 debug instrumentation state, see the "debug" section below */
+struct i2c_hid_syna_dbg {
+	struct work_struct	dump_work;
+	struct delayed_work	poll_work;
+	const char		*dump_reason;
+
+	unsigned long		touchpad_reports;
+	unsigned long		mouse_reports;
+	unsigned long		other_reports;
+	unsigned long		unsolicited_resets;
+	unsigned long		recv_errors;
+	unsigned long		id_switches;
+	unsigned long		idle_gaps;
+	unsigned long		resyncs;
+
+	u8			last_id;		/* last input report ID */
+	u8			last_report[32];	/* last input report */
+	u16			last_len;
+	u8			mode[8];		/* last polled Input Mode */
+	int			mode_len;
+};
+
 /* The main device structure */
 struct i2c_hid {
 	struct i2c_client	*client;	/* i2c client */
@@ -109,6 +131,8 @@ struct i2c_hid {
 	struct work_struct	syna_resync_work;
 	struct list_head	syna_resync_node;	/* on syna_resync_devices */
 	unsigned long		last_input_jiffies;	/* for idle detection */
+
+	struct i2c_hid_syna_dbg	syna_dbg;
 };
 
 /*
@@ -504,6 +528,8 @@ MODULE_PARM_DESC(syna_resync_after_resume,
 
 static bool syna_resync_now;
 
+static void i2c_hid_syna_dbg_dump(struct i2c_hid *ihid, const char *why);
+
 static void i2c_hid_syna_resync_work(struct work_struct *work)
 {
 	struct i2c_hid *ihid = container_of(work, struct i2c_hid,
@@ -512,6 +538,8 @@ static void i2c_hid_syna_resync_work(struct work_struct *work)
 	int ret;
 
 	dev_info(dev, "resyncing Synaptics device\n");
+	ihid->syna_dbg.resyncs++;
+	i2c_hid_syna_dbg_dump(ihid, "before resync");
 
 	mutex_lock(&ihid->reset_lock);
 	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
@@ -525,6 +553,8 @@ static void i2c_hid_syna_resync_work(struct work_struct *work)
 	ret = hid_driver_reset_resume(ihid->hid);
 	if (ret)
 		dev_warn(dev, "Synaptics reset-resume failed: %d\n", ret);
+
+	i2c_hid_syna_dbg_dump(ihid, "after resync");
 }
 
 static void i2c_hid_queue_syna_resync(struct i2c_hid *ihid)
@@ -609,6 +639,373 @@ module_param_cb(syna_resync_now, &param_ops_syna_resync_now,
 MODULE_PARM_DESC(syna_resync_now,
 		 "Write Y/1/true to manually queue a SYNA2BA6 resync");
 
+/*
+ * SYNA2BA6 debug instrumentation (debug branch only, see DEBUG.md)
+ *
+ * Collects what is needed to tell apart the candidate root causes of the
+ * "pointer moves, gestures don't" state:
+ *  A) the firmware falls back to mouse mode: input switches from report
+ *     0x03 (touchpad) to 0x02 (mouse) and the Input Mode feature report no
+ *     longer reads 0x03. A device-initiated reset, i.e. a zero-length input
+ *     report while no reset is pending, would explain this, since the stock
+ *     driver silently drops it.
+ *  B) a contact gets stuck: input stays on report 0x03 but the last report
+ *     before an idle gap still has a finger down.
+ *
+ * Every message is prefixed with "syna-dbg:".
+ */
+#define SYNA_DBG_ID_MOUSE	0x02
+#define SYNA_DBG_ID_TOUCHPAD	0x03
+#define SYNA_DBG_FEATURE_MAX	64
+
+static unsigned int syna_dbg_gap_ms = 5000;
+module_param(syna_dbg_gap_ms, uint, 0644);
+MODULE_PARM_DESC(syna_dbg_gap_ms,
+		 "Log the last/first input report around idle gaps longer than this in ms, 0 disables");
+
+static bool syna_dbg_resync_on_reset;
+module_param(syna_dbg_resync_on_reset, bool, 0644);
+MODULE_PARM_DESC(syna_dbg_resync_on_reset,
+		 "Queue a resync when the device resets itself (candidate root-cause fix)");
+
+static unsigned int syna_dbg_poll_ms;
+
+static bool i2c_hid_syna_dbg_has_usage(struct hid_report *report,
+				       unsigned int usage)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < report->maxfield; i++)
+		for (j = 0; j < report->field[i]->maxusage; j++)
+			if (report->field[i]->usage[j].hid == usage)
+				return true;
+
+	return false;
+}
+
+/* Feature reports holding state that hid-multitouch writes to the device */
+static const char *i2c_hid_syna_dbg_feature_name(struct hid_report *report)
+{
+	if (i2c_hid_syna_dbg_has_usage(report, HID_DG_INPUTMODE))
+		return "input mode";
+	if (i2c_hid_syna_dbg_has_usage(report, HID_DG_SURFACESWITCH) ||
+	    i2c_hid_syna_dbg_has_usage(report, HID_DG_BUTTONSWITCH))
+		return "surface/button switch";
+	if (i2c_hid_syna_dbg_has_usage(report, HID_DG_LATENCYMODE))
+		return "latency mode";
+
+	return NULL;
+}
+
+static const char *i2c_hid_syna_dbg_id_name(u8 id)
+{
+	switch (id) {
+	case SYNA_DBG_ID_MOUSE:
+		return "mouse";
+	case SYNA_DBG_ID_TOUCHPAD:
+		return "touchpad";
+	default:
+		return "other";
+	}
+}
+
+static int i2c_hid_syna_dbg_get_feature(struct i2c_hid *ihid,
+					struct hid_report *report, u8 *buf)
+{
+	unsigned int len = hid_report_len(report);
+
+	if (len > SYNA_DBG_FEATURE_MAX)
+		return -E2BIG;
+
+	return hid_hw_raw_request(ihid->hid, report->id, buf, len,
+				  HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
+}
+
+/* Read back and log the feature reports; may sleep. */
+static void i2c_hid_syna_dbg_dump(struct i2c_hid *ihid, const char *why)
+{
+	struct device *dev = &ihid->client->dev;
+	struct hid_report *report;
+	const char *name;
+	u8 buf[SYNA_DBG_FEATURE_MAX];
+	int ret;
+
+	if (!test_bit(I2C_HID_STARTED, &ihid->flags)) {
+		dev_info(dev, "syna-dbg: feature dump (%s) skipped, device not started\n",
+			 why);
+		return;
+	}
+
+	dev_info(dev, "syna-dbg: feature dump (%s), last input 0x%02x (%s) %u ms ago\n",
+		 why, ihid->syna_dbg.last_id,
+		 i2c_hid_syna_dbg_id_name(ihid->syna_dbg.last_id),
+		 jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
+
+	list_for_each_entry(report,
+			    &ihid->hid->report_enum[HID_FEATURE_REPORT].report_list,
+			    list) {
+		name = i2c_hid_syna_dbg_feature_name(report);
+		if (!name)
+			continue;
+
+		ret = i2c_hid_syna_dbg_get_feature(ihid, report, buf);
+		if (ret < 0)
+			dev_warn(dev, "syna-dbg:   feature 0x%02x (%s): read failed: %d\n",
+				 report->id, name, ret);
+		else
+			dev_info(dev, "syna-dbg:   feature 0x%02x (%s): %*ph\n",
+				 report->id, name, ret, buf);
+	}
+}
+
+static void i2c_hid_syna_dbg_dump_work(struct work_struct *work)
+{
+	struct i2c_hid *ihid = container_of(work, struct i2c_hid,
+					    syna_dbg.dump_work);
+
+	i2c_hid_syna_dbg_dump(ihid, READ_ONCE(ihid->syna_dbg.dump_reason));
+}
+
+static void i2c_hid_syna_dbg_queue_dump(struct i2c_hid *ihid, const char *why)
+{
+	WRITE_ONCE(ihid->syna_dbg.dump_reason, why);
+	schedule_work(&ihid->syna_dbg.dump_work);
+}
+
+/* Periodically read Input Mode and log only when it changes. */
+static void i2c_hid_syna_dbg_poll_work(struct work_struct *work)
+{
+	struct i2c_hid *ihid = container_of(to_delayed_work(work),
+					    struct i2c_hid,
+					    syna_dbg.poll_work);
+	struct i2c_hid_syna_dbg *dbg = &ihid->syna_dbg;
+	struct device *dev = &ihid->client->dev;
+	unsigned int poll_ms = READ_ONCE(syna_dbg_poll_ms);
+	struct hid_report *report;
+	u8 buf[SYNA_DBG_FEATURE_MAX];
+	int ret;
+
+	if (!poll_ms || !test_bit(I2C_HID_STARTED, &ihid->flags))
+		return;
+
+	list_for_each_entry(report,
+			    &ihid->hid->report_enum[HID_FEATURE_REPORT].report_list,
+			    list) {
+		if (!i2c_hid_syna_dbg_has_usage(report, HID_DG_INPUTMODE))
+			continue;
+
+		ret = i2c_hid_syna_dbg_get_feature(ihid, report, buf);
+		if (ret < 0) {
+			dev_warn_ratelimited(dev, "syna-dbg: poll: input mode read failed: %d\n",
+					     ret);
+		} else if (ret != dbg->mode_len || memcmp(buf, dbg->mode, ret)) {
+			ret = min_t(int, ret, sizeof(dbg->mode));
+			dev_info(dev, "syna-dbg: poll: input mode %*ph -> %*ph, last input %u ms ago\n",
+				 dbg->mode_len, dbg->mode, ret, buf,
+				 jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
+			memcpy(dbg->mode, buf, ret);
+			dbg->mode_len = ret;
+		}
+		break;
+	}
+
+	schedule_delayed_work(&dbg->poll_work, msecs_to_jiffies(poll_ms));
+}
+
+static void i2c_hid_syna_dbg_kick_poll(struct i2c_hid *ihid)
+{
+	unsigned int poll_ms = READ_ONCE(syna_dbg_poll_ms);
+
+	if (poll_ms)
+		schedule_delayed_work(&ihid->syna_dbg.poll_work,
+				      msecs_to_jiffies(poll_ms));
+}
+
+static int i2c_hid_syna_dbg_format_stats(struct i2c_hid *ihid, char *buf,
+					 size_t size)
+{
+	struct i2c_hid_syna_dbg *dbg = &ihid->syna_dbg;
+
+	return scnprintf(buf, size,
+			 "%s: touchpad=%lu mouse=%lu other=%lu unsolicited_resets=%lu recv_errors=%lu id_switches=%lu idle_gaps=%lu resyncs=%lu last_id=0x%02x last_input_ms_ago=%u\n",
+			 dev_name(&ihid->client->dev),
+			 dbg->touchpad_reports, dbg->mouse_reports,
+			 dbg->other_reports, dbg->unsolicited_resets,
+			 dbg->recv_errors, dbg->id_switches, dbg->idle_gaps,
+			 dbg->resyncs, dbg->last_id,
+			 jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
+}
+
+/* Called for every input report, before i2c_hid_syna_idle_resync(). */
+static void i2c_hid_syna_dbg_input(struct i2c_hid *ihid, const u8 *data,
+				   u16 len)
+{
+	struct i2c_hid_syna_dbg *dbg = &ihid->syna_dbg;
+	struct device *dev = &ihid->client->dev;
+	unsigned int gap_ms;
+	u16 shown;
+	u8 id;
+
+	if (!(ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC))
+		return;
+
+	gap_ms = jiffies_to_msecs(jiffies - ihid->last_input_jiffies);
+	shown = min_t(u16, len, sizeof(dbg->last_report));
+	id = len ? data[0] : 0;
+
+	switch (id) {
+	case SYNA_DBG_ID_TOUCHPAD:
+		dbg->touchpad_reports++;
+		break;
+	case SYNA_DBG_ID_MOUSE:
+		dbg->mouse_reports++;
+		break;
+	default:
+		dbg->other_reports++;
+		break;
+	}
+
+	if (syna_dbg_gap_ms && gap_ms >= syna_dbg_gap_ms) {
+		dbg->idle_gaps++;
+		dev_info(dev, "syna-dbg: input after %u ms idle\n", gap_ms);
+		dev_info(dev, "syna-dbg:   last before idle: %*ph\n",
+			 dbg->last_len, dbg->last_report);
+		dev_info(dev, "syna-dbg:   first after idle: %*ph\n",
+			 shown, data);
+	}
+
+	if (dbg->last_id && id != dbg->last_id) {
+		dbg->id_switches++;
+		dev_warn_ratelimited(dev, "syna-dbg: input report 0x%02x (%s) -> 0x%02x (%s), %u ms after previous input\n",
+				     dbg->last_id,
+				     i2c_hid_syna_dbg_id_name(dbg->last_id),
+				     id, i2c_hid_syna_dbg_id_name(id), gap_ms);
+		if (id == SYNA_DBG_ID_MOUSE)
+			i2c_hid_syna_dbg_queue_dump(ihid,
+						    "switched to mouse reports");
+	}
+
+	dbg->last_id = id;
+	memcpy(dbg->last_report, data, shown);
+	dbg->last_len = shown;
+}
+
+/* Zero-length input report while no host-initiated reset is pending. */
+static void i2c_hid_syna_dbg_unsolicited_reset(struct i2c_hid *ihid)
+{
+	struct device *dev = &ihid->client->dev;
+
+	if (!(ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC))
+		return;
+
+	ihid->syna_dbg.unsolicited_resets++;
+	dev_warn_ratelimited(dev, "syna-dbg: device-initiated reset (zero-length input report, no reset pending), last input %u ms ago\n",
+			     jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
+
+	if (syna_dbg_resync_on_reset) {
+		dev_info(dev, "syna-dbg: queuing Synaptics resync after device-initiated reset\n");
+		i2c_hid_queue_syna_resync(ihid);
+	} else {
+		i2c_hid_syna_dbg_queue_dump(ihid, "after device-initiated reset");
+	}
+}
+
+static void i2c_hid_syna_dbg_recv_error(struct i2c_hid *ihid, int error)
+{
+	if (!(ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC))
+		return;
+
+	ihid->syna_dbg.recv_errors++;
+	dev_warn_ratelimited(&ihid->client->dev,
+			     "syna-dbg: input read failed: %d\n", error);
+}
+
+static int param_set_syna_dbg_poll_ms(const char *val,
+				      const struct kernel_param *kp)
+{
+	struct i2c_hid *ihid;
+	int ret;
+
+	ret = param_set_uint(val, kp);
+	if (ret)
+		return ret;
+
+	mutex_lock(&syna_resync_devices_lock);
+	list_for_each_entry(ihid, &syna_resync_devices, syna_resync_node)
+		i2c_hid_syna_dbg_kick_poll(ihid);
+	mutex_unlock(&syna_resync_devices_lock);
+
+	return 0;
+}
+
+static const struct kernel_param_ops param_ops_syna_dbg_poll_ms = {
+	.set = param_set_syna_dbg_poll_ms,
+	.get = param_get_uint,
+};
+
+module_param_cb(syna_dbg_poll_ms, &param_ops_syna_dbg_poll_ms,
+		&syna_dbg_poll_ms, 0644);
+MODULE_PARM_DESC(syna_dbg_poll_ms,
+		 "Read Input Mode every N ms and log changes, 0 disables (keeps the bus busy)");
+
+static int param_set_syna_dbg_mark(const char *val,
+				   const struct kernel_param *kp)
+{
+	struct i2c_hid *ihid;
+	char line[256];
+
+	pr_info("i2c_hid: syna-dbg: ===== MARK: %.*s =====\n",
+		(int)strcspn(val, "\n"), val);
+
+	mutex_lock(&syna_resync_devices_lock);
+	list_for_each_entry(ihid, &syna_resync_devices, syna_resync_node) {
+		i2c_hid_syna_dbg_format_stats(ihid, line, sizeof(line));
+		dev_info(&ihid->client->dev, "syna-dbg: stats %s", line);
+		dev_info(&ihid->client->dev, "syna-dbg: last input: %*ph\n",
+			 ihid->syna_dbg.last_len, ihid->syna_dbg.last_report);
+		i2c_hid_syna_dbg_queue_dump(ihid, "mark");
+	}
+	mutex_unlock(&syna_resync_devices_lock);
+
+	return 0;
+}
+
+static const struct kernel_param_ops param_ops_syna_dbg_mark = {
+	.set = param_set_syna_dbg_mark,
+};
+
+module_param_cb(syna_dbg_mark, &param_ops_syna_dbg_mark, NULL, 0200);
+MODULE_PARM_DESC(syna_dbg_mark,
+		 "Write a note to log it with stats and a feature dump");
+
+static int param_set_syna_dbg_stats(const char *val,
+				    const struct kernel_param *kp)
+{
+	return -EPERM;
+}
+
+static int param_get_syna_dbg_stats(char *buf, const struct kernel_param *kp)
+{
+	struct i2c_hid *ihid;
+	int len = 0;
+
+	mutex_lock(&syna_resync_devices_lock);
+	list_for_each_entry(ihid, &syna_resync_devices, syna_resync_node)
+		len += i2c_hid_syna_dbg_format_stats(ihid, buf + len,
+						     PAGE_SIZE - len);
+	mutex_unlock(&syna_resync_devices_lock);
+
+	return len;
+}
+
+static const struct kernel_param_ops param_ops_syna_dbg_stats = {
+	.set = param_set_syna_dbg_stats,
+	.get = param_get_syna_dbg_stats,
+};
+
+module_param_cb(syna_dbg_stats, &param_ops_syna_dbg_stats, NULL, 0444);
+MODULE_PARM_DESC(syna_dbg_stats, "Per-device input/reset counters");
+
 static void i2c_hid_get_input(struct i2c_hid *ihid)
 {
 	u16 size = le16_to_cpu(ihid->hdesc.wMaxInputLength);
@@ -620,8 +1017,10 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 
 	ret = i2c_master_recv(ihid->client, ihid->inbuf, size);
 	if (ret != size) {
-		if (ret < 0)
+		if (ret < 0) {
+			i2c_hid_syna_dbg_recv_error(ihid, ret);
 			return;
+		}
 
 		dev_err(&ihid->client->dev, "%s: got %d data instead of %d\n",
 			__func__, ret, size);
@@ -634,6 +1033,8 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		/* host or device initiated RESET completed */
 		if (test_and_clear_bit(I2C_HID_RESET_PENDING, &ihid->flags))
 			wake_up(&ihid->wait);
+		else
+			i2c_hid_syna_dbg_unsolicited_reset(ihid);
 		return;
 	}
 
@@ -650,6 +1051,8 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		if (ihid->hid->group != HID_GROUP_RMI)
 			pm_wakeup_event(&ihid->client->dev, 0);
 
+		i2c_hid_syna_dbg_input(ihid, ihid->inbuf + sizeof(__le16),
+				       ret_size - sizeof(__le16));
 		hid_safe_input_report(ihid->hid, HID_INPUT_REPORT,
 				      ihid->inbuf + sizeof(__le16),
 				      ihid->bufsize - sizeof(__le16),
@@ -1023,14 +1426,24 @@ static int i2c_hid_core_suspend(struct i2c_hid *ihid)
 	int ret;
 
 	cancel_work_sync(&ihid->syna_resync_work);
+	cancel_work_sync(&ihid->syna_dbg.dump_work);
+	cancel_delayed_work_sync(&ihid->syna_dbg.poll_work);
 
 	ret = hid_driver_suspend(hid, PMSG_SUSPEND);
 	if (ret < 0)
 		return ret;
 
-	i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
+	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
+	if (ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC)
+		dev_info(&client->dev, "syna-dbg: suspend: SET_POWER(SLEEP) = %d, last input 0x%02x %u ms ago\n",
+			 ret, ihid->syna_dbg.last_id,
+			 jiffies_to_msecs(jiffies - ihid->last_input_jiffies));
 
 	disable_irq(client->irq);
+
+	/* Drop debug work queued by an interrupt since the cancels above */
+	cancel_work_sync(&ihid->syna_dbg.dump_work);
+	cancel_delayed_work_sync(&ihid->syna_dbg.poll_work);
 
 	return 0;
 }
@@ -1043,10 +1456,16 @@ static int i2c_hid_core_resume(struct i2c_hid *ihid)
 	enable_irq(ihid->client->irq);
 
 	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
+	if (ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC)
+		dev_info(&ihid->client->dev, "syna-dbg: resume: SET_POWER(ON) = %d\n",
+			 ret);
 	if (ret)
 		return ret;
 
 	ret = hid_driver_reset_resume(hid);
+	if (ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC)
+		dev_info(&ihid->client->dev, "syna-dbg: resume: reset_resume = %d\n",
+			 ret);
 	if (ret)
 		return ret;
 
@@ -1145,6 +1564,9 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 	mutex_init(&ihid->reset_lock);
 	INIT_WORK(&ihid->syna_resync_work, i2c_hid_syna_resync_work);
 	INIT_LIST_HEAD(&ihid->syna_resync_node);
+	INIT_WORK(&ihid->syna_dbg.dump_work, i2c_hid_syna_dbg_dump_work);
+	INIT_DELAYED_WORK(&ihid->syna_dbg.poll_work,
+			  i2c_hid_syna_dbg_poll_work);
 
 	/* we need to allocate the command buffer without knowing the maximum
 	 * size of the reports. Let's use HID_MIN_BUFFER_SIZE, then we do the
@@ -1183,6 +1605,9 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
 		mutex_lock(&syna_resync_devices_lock);
 		list_add_tail(&ihid->syna_resync_node, &syna_resync_devices);
 		mutex_unlock(&syna_resync_devices_lock);
+
+		dev_info(&client->dev, "syna-dbg: debug instrumentation active\n");
+		i2c_hid_syna_dbg_kick_poll(ihid);
 	}
 
 	return 0;
@@ -1263,7 +1688,16 @@ static void i2c_hid_core_pm_complete(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 
-	i2c_hid_syna_resume_resync(ihid);
+	if (!(ihid->quirks & I2C_HID_QUIRK_SYNA_RESYNC))
+		return;
+
+	/* The resync work dumps the feature state itself */
+	if (syna_resync_after_resume)
+		i2c_hid_syna_resume_resync(ihid);
+	else
+		i2c_hid_syna_dbg_queue_dump(ihid, "after system resume");
+
+	i2c_hid_syna_dbg_kick_poll(ihid);
 }
 
 const struct dev_pm_ops i2c_hid_core_pm = {

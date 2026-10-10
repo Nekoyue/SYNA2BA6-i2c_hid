@@ -9,6 +9,9 @@ pointer but loses multitouch gestures (e.g. two-finger scroll).
 **Fix attempt:** resync the touchpad automatically after idle and after system resume,
 or manually on demand.
 
+> **Debug branch:** this build also carries root-cause instrumentation. See
+> [DEBUG.md](./DEBUG.md).
+
 ## How It Works
 
 A resync sends `SET_POWER(ON)` to the device, then runs the HID driver's
